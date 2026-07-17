@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "piezoscanner"
+version = "1.0.0"
+description = "Research-grade PyQt6 controller and live raster-scan viewer for piezo scan stages driven through a Levylab FLEX Lockin."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Proprietary" }
+authors = [{ name = "Pubudu Wijesinghe", email = "pubudu.wijesinghe@levylab.org" }]
+dependencies = [
+    "PyQt6>=6.6",
+    "numpy>=1.24",
+    "matplotlib>=3.7",
+]
+
+# `flex` (the Levylab FLEX instrument framework that provides
+# flex.inst.levylab.Lockin.Lockin) is an internal lab package distributed
+# outside PyPI. Install it separately in the same environment before running
+# this tool. Without it, the application still launches in Simulation Mode.
+
+[project.scripts]
+piezoscanner = "piezoscanner.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
