@@ -1,4 +1,4 @@
-# PiezoScanner
+# FLEX PiezoScanner
 
 PyQt6 app for driving a piezo scan stage through the Levylab FLEX Lockin and
 grabbing raster-scan images off up to 3 detector channels.
@@ -28,7 +28,9 @@ git clone https://github.com/levylabpitt/PiezoScanner.git
 cd PiezoScanner
 ```
 
-With `uv`:
+With `uv` (if you don't have it yet, on Windows run
+`powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"`
+then reopen your terminal so it picks up PATH):
 
 ```bash
 uv venv

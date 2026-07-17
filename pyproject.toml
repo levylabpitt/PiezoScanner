@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "piezoscanner"
 version = "1.0.0"
-description = "Research-grade PyQt6 controller and live raster-scan viewer for piezo scan stages driven through a Levylab FLEX Lockin."
+description = "FLEX PiezoScanner: PyQt6 controller and live raster-scan viewer for piezo scan stages driven through a Levylab FLEX Lockin."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Proprietary" }

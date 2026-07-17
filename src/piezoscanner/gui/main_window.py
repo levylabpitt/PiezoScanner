@@ -42,7 +42,7 @@ def _connect_hardware():
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("PiezoScanner — Research-Grade Piezo Raster Scan Controller")
+        self.setWindowTitle("FLEX PiezoScanner")
         self.resize(1500, 900)
 
         self.settings = QSettings(ORG_NAME, APP_NAME)
@@ -446,9 +446,9 @@ class MainWindow(QMainWindow):
 
     def _show_about(self):
         QMessageBox.about(
-            self, "About PiezoScanner",
-            "PiezoScanner\n\n"
-            "Research-grade piezo raster-scan controller for a Levylab FLEX Lockin.\n\n"
+            self, "About FLEX PiezoScanner",
+            "FLEX PiezoScanner\n\n"
+            "Piezo raster-scan controller for a Levylab FLEX Lockin.\n\n"
             f"Hardware: {'Connected' if self.hardware_connected else 'Simulation Mode'}",
         )
 
