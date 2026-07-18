@@ -1,6 +1,6 @@
 """Top-level window: wires the control panel, plot panel, background
-scan/quick-command workers, hardware connection, and settings persistence
-together."""
+scan/quick-command workers, hardware connection, configuration, and
+settings persistence together."""
 
 from __future__ import annotations
 
@@ -12,13 +12,24 @@ from dataclasses import asdict, replace as dc_replace
 import numpy as np
 from PyQt6.QtCore import QSettings, Qt, QThreadPool, QTimer
 from PyQt6.QtGui import QAction, QKeySequence
-from PyQt6.QtWidgets import QApplication, QLabel, QMainWindow, QMessageBox, QSplitter, QStatusBar
+from PyQt6.QtWidgets import (
+    QApplication,
+    QDialog,
+    QLabel,
+    QMainWindow,
+    QMessageBox,
+    QSplitter,
+    QStatusBar,
+)
 
-from ..core.profiles import PROFILES
+from ..core.config import AppConfig, load_config
+from ..core.profiles import ScannerProfile
 from ..core.scanner import PiezoScanner, ScanLineResult
 from ..core.simulated_daq import SimulatedDaq
 from . import theme
+from .config_dialog import ConfigDialog
 from .control_panel import ChannelSlot, ControlPanel
+from .find_surface_dialog import FindSurfaceDialog
 from .plot_panel import PlotPanel
 from .scan_worker import QuickCommand, ScanWorker
 
@@ -48,13 +59,24 @@ class MainWindow(QMainWindow):
         self.settings = QSettings(ORG_NAME, APP_NAME)
         self.daq, self.hardware_connected = _connect_hardware()
 
+        self.app_config, config_error = load_config()
+
         self.worker: ScanWorker | None = None
         self._active_config: dict | None = None
         self._active_slots: list[ChannelSlot] = []
         self._scan_start_time: float | None = None
         self._dark_theme = True
 
-        self.control_panel = ControlPanel()
+        # 3D scan bookkeeping
+        self._scan3d_folder: str | None = None
+        self._n_slices = 1
+        self._slices_saved = 0
+        self._lines_done = 0
+
+        self.control_panel = ControlPanel(
+            profiles=self.app_config.profiles,
+            z_available=self.app_config.outputs.z_enabled,
+        )
         self.plot_panel = PlotPanel()
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -62,7 +84,7 @@ class MainWindow(QMainWindow):
         splitter.addWidget(self.plot_panel)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
-        splitter.setSizes([380, 1120])
+        splitter.setSizes([400, 1100])
         self.setCentralWidget(splitter)
 
         self._build_menu()
@@ -75,6 +97,9 @@ class MainWindow(QMainWindow):
 
         self._restore_settings()
         self._update_hardware_status_label()
+
+        if config_error:
+            QTimer.singleShot(0, lambda: QMessageBox.warning(self, "Configuration", config_error))
 
     # ------------------------------------------------------------------
     # Menu / status bar
@@ -112,6 +137,17 @@ class MainWindow(QMainWindow):
         act_full.triggered.connect(self.full_range)
         scan_menu.addAction(act_full)
 
+        scan_menu.addSeparator()
+        act_surface = QAction("Find Surface...", self)
+        act_surface.triggered.connect(self.open_find_surface)
+        scan_menu.addAction(act_surface)
+
+        settings_menu = menu_bar.addMenu("S&ettings")
+        act_config = QAction("Configure Hardware...", self)
+        act_config.setShortcut(QKeySequence("Ctrl+,"))
+        act_config.triggered.connect(self.open_config_dialog)
+        settings_menu.addAction(act_config)
+
         view_menu = menu_bar.addMenu("&View")
         self.act_dark_theme = QAction("Dark Theme", self)
         self.act_dark_theme.setCheckable(True)
@@ -131,8 +167,11 @@ class MainWindow(QMainWindow):
         self.lbl_hw_status = QLabel()
         bar.addPermanentWidget(self.lbl_hw_status)
 
-        self.lbl_position = QLabel("Position: —")
+        self.lbl_position = QLabel("XY: —")
         bar.addPermanentWidget(self.lbl_position)
+
+        self.lbl_z = QLabel("Z: —")
+        bar.addPermanentWidget(self.lbl_z)
 
         self.lbl_elapsed = QLabel("")
         bar.addPermanentWidget(self.lbl_elapsed)
@@ -157,9 +196,7 @@ class MainWindow(QMainWindow):
         cp.full_range_requested.connect(self.full_range)
         cp.move_to_requested.connect(self._move_to_voltage)
         cp.channels_changed.connect(self._on_channels_changed)
-        cp.browse_directory_requested.connect(
-            lambda path: self.control_panel.set_status(f"Save directory: {path}")
-        )
+        cp.find_surface_requested.connect(self.open_find_surface)
 
         pp = self.plot_panel
         pp.region_selected_um.connect(self._on_region_selected_um)
@@ -169,6 +206,43 @@ class MainWindow(QMainWindow):
         self.plot_panel.sync_channels(self.control_panel.enabled_channel_slots())
 
     # ------------------------------------------------------------------
+    # Configuration
+    # ------------------------------------------------------------------
+    def open_config_dialog(self):
+        if self.worker is not None:
+            QMessageBox.warning(self, "Scan in Progress", "Finish or abort the scan before changing configuration.")
+            return
+        dialog = ConfigDialog(self.app_config, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted and dialog.result_config is not None:
+            self.app_config = dialog.result_config
+            self._apply_config()
+            self.control_panel.set_status("Configuration saved")
+
+    def _apply_config(self):
+        self.control_panel.set_profiles(self.app_config.profiles)
+        self.control_panel.set_z_available(self.app_config.outputs.z_enabled)
+
+    def _profile_for(self, name: str) -> ScannerProfile:
+        profile = self.app_config.profiles.get(name)
+        if profile is None:
+            profile = next(iter(self.app_config.profiles.values()))
+        return profile
+
+    def _make_scanner(self, cfg: dict) -> PiezoScanner:
+        profile = self._profile_for(cfg["profile"])
+        # Apply the (possibly user-edited) calibration shown in the GUI
+        # without mutating the shared config.
+        profile = dc_replace(profile, calibration_um_per_v=cfg["calibration_um_per_v"])
+        return PiezoScanner(
+            daq=self.daq,
+            profile=profile,
+            fast_axis_channel=self.app_config.outputs.x_channel,
+            slow_axis_channel=self.app_config.outputs.y_channel,
+            daq_fs=13000,
+            daq_num_samples=1000,
+        )
+
+    # ------------------------------------------------------------------
     # Scan lifecycle
     # ------------------------------------------------------------------
     def start_scan(self):
@@ -176,12 +250,20 @@ class MainWindow(QMainWindow):
             return
 
         cfg = self.control_panel.get_scan_config()
+        outputs = self.app_config.outputs
+
+        if outputs.x_channel == 0 or outputs.y_channel == 0:
+            QMessageBox.warning(
+                self, "Outputs Not Configured",
+                "X and Y output channels must be set (Settings → Configure Hardware…).",
+            )
+            return
 
         if cfg["x_min"] >= cfg["x_max"] or cfg["y_min"] >= cfg["y_max"]:
             QMessageBox.warning(self, "Invalid Range", "Min must be less than Max for both X and Y.")
             return
 
-        profile = PROFILES[cfg["profile"]]
+        profile = self._profile_for(cfg["profile"])
         for value in (cfg["x_min"], cfg["x_max"], cfg["y_min"], cfg["y_max"]):
             if value < profile.vmin or value > profile.vmax:
                 QMessageBox.warning(
@@ -189,6 +271,27 @@ class MainWindow(QMainWindow):
                     f"{profile.name} safe range is {profile.vmin} to {profile.vmax} V.",
                 )
                 return
+
+        is_3d = cfg["mode"] == "3D"
+        z_values: list[float] | None = None
+        if is_3d:
+            if not outputs.z_enabled:
+                QMessageBox.warning(
+                    self, "No Z Output",
+                    "3D mode needs a Z output channel (Settings → Configure Hardware…).",
+                )
+                return
+            if cfg["z_min"] >= cfg["z_max"]:
+                QMessageBox.warning(self, "Invalid Range", "Z min must be less than Z max.")
+                return
+            for value in (cfg["z_min"], cfg["z_max"]):
+                if value < profile.vmin or value > profile.vmax:
+                    QMessageBox.warning(
+                        self, "Out of Range",
+                        f"{profile.name} safe range is {profile.vmin} to {profile.vmax} V.",
+                    )
+                    return
+            z_values = list(np.linspace(cfg["z_min"], cfg["z_max"], cfg["z_steps"]))
 
         slots = self.control_panel.enabled_channel_slots()
         if not slots:
@@ -199,24 +302,32 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Duplicate Channels", "Each enabled channel needs a distinct AI channel number.")
             return
 
-        scanner = PiezoScanner(
-            daq=self.daq,
-            profile=cfg["profile"],
-            fast_axis_channel=cfg["fast_axis_channel"],
-            slow_axis_channel=cfg["slow_axis_channel"],
-            daq_fs=13000,
-            daq_num_samples=1000,
-        )
-        # Apply the (possibly user-edited) calibration shown in the GUI
-        # without mutating the shared PROFILES table.
-        scanner.profile = dc_replace(scanner.profile, calibration_um_per_v=cfg["calibration_um_per_v"])
+        # 3D scans stream each slice to disk as it completes, so the target
+        # folder has to exist before the scan starts.
+        self._scan3d_folder = None
+        self._slices_saved = 0
+        if is_3d:
+            save_dir = self.control_panel.save_directory or os.getcwd()
+            folder = os.path.join(save_dir, time.strftime("3DScan_%Y%m%d_%H%M%S"))
+            try:
+                os.makedirs(folder, exist_ok=True)
+                self._write_3d_meta(folder, cfg, z_values)
+            except OSError as exc:
+                QMessageBox.critical(self, "Save Error", f"Could not create scan folder: {exc}")
+                return
+            self._scan3d_folder = folder
+
+        scanner = self._make_scanner(cfg)
 
         self._active_config = cfg
         self._active_slots = slots
+        self._n_slices = len(z_values) if z_values else 1
+        self._lines_done = 0
 
         cal = cfg["calibration_um_per_v"]
         extent = (cfg["x_min"] * cal, cfg["x_max"] * cal, cfg["y_min"] * cal, cfg["y_max"] * cal)
-        self.plot_panel.reset_for_scan(slots, cfg["x_points"], cfg["y_points"], extent)
+        z_range = (cfg["z_min"], cfg["z_max"]) if is_3d else None
+        self.plot_panel.reset_for_scan(slots, cfg["x_points"], cfg["y_points"], extent, z_range=z_range)
 
         self.worker = ScanWorker(
             scanner,
@@ -229,8 +340,12 @@ class MainWindow(QMainWindow):
             y_max=cfg["y_max"],
             detector_channels=channel_numbers,
             delay_samples=cfg["delay_samples"],
+            z_values=z_values,
+            z_channel=outputs.z_channel,
         )
         self.worker.line_ready.connect(self._on_line_ready)
+        self.worker.slice_started.connect(self._on_slice_started)
+        self.worker.slice_completed.connect(self._on_slice_completed)
         self.worker.progress_changed.connect(self.control_panel.set_progress)
         self.worker.status_changed.connect(self.control_panel.set_status)
         self.worker.finished_ok.connect(self._on_scan_finished)
@@ -252,14 +367,43 @@ class MainWindow(QMainWindow):
         if self.worker is not None:
             self.worker.set_paused(paused)
 
-    def _on_line_ready(self, result: ScanLineResult):
+    def _on_line_ready(self, slice_index: int, result: ScanLineResult):
         for channel_number, pixels in result.pixels.items():
             self.plot_panel.update_line(channel_number, result.line_index, pixels)
 
         if self._active_config is not None:
-            remaining = self._active_config["y_points"] - (result.line_index + 1)
-            eta_s = max(remaining, 0) * self._active_config["line_time"]
+            self._lines_done += 1
+            total = self._n_slices * self._active_config["y_points"]
+            remaining = max(total - self._lines_done, 0)
+            eta_s = remaining * self._active_config["line_time"]
             self.control_panel.set_eta(f"ETA: {self._format_duration(eta_s)}")
+
+    def _on_slice_started(self, slice_index: int, z_value: float):
+        self.plot_panel.clear_current_images()
+        self.plot_panel.set_slice_info(
+            f"Slice {slice_index + 1}/{self._n_slices} — Z = {z_value:.3f} V"
+        )
+        self.lbl_z.setText(f"Z: {z_value:.3f} V")
+
+    def _on_slice_completed(self, slice_index: int, z_value: float):
+        folder = self._scan3d_folder
+        if folder is not None:
+            try:
+                for slot in self._active_slots:
+                    view = self.plot_panel.channel_views().get(slot.number)
+                    if view is None or view.image_data is None:
+                        continue
+                    safe_label = "".join(c if c.isalnum() else "_" for c in slot.label)
+                    fname = f"slice{slice_index:03d}_Z{z_value:.4f}V_AI{slot.number}_{safe_label}.txt"
+                    np.savetxt(
+                        os.path.join(folder, fname), view.image_data, delimiter="\t",
+                        header=f"{slot.label} (AI{slot.number}) at Z = {z_value:.6f} V — tab separated Volts",
+                    )
+                self._slices_saved += 1
+            except OSError as exc:
+                self.control_panel.set_status(f"Slice save failed: {exc}")
+
+        self.plot_panel.add_slice(z_value)
 
     def _on_scan_finished(self, completed: bool):
         self._elapsed_timer.stop()
@@ -272,6 +416,25 @@ class MainWindow(QMainWindow):
         if self.worker is not None:
             self.worker.wait()
         self.worker = None
+
+        if self._scan3d_folder is not None:
+            folder = self._scan3d_folder
+            self._scan3d_folder = None
+            try:
+                with open(os.path.join(folder, "meta.txt"), "a", encoding="utf-8") as fh:
+                    fh.write(f"slices_completed: {self._slices_saved}\n")
+                    fh.write(f"finished: {'complete' if completed else 'aborted'}\n")
+            except OSError:
+                pass
+
+            state = "complete" if completed else "stopped"
+            self.control_panel.set_status(f"3D scan {state} — {self._slices_saved} slice(s) saved")
+            if self._slices_saved > 0:
+                QMessageBox.information(
+                    self, "3D Scan Saved",
+                    f"{self._slices_saved} slice(s) saved to:\n{folder}",
+                )
+            return
 
         has_data = any(
             view.image_data is not None and np.any(~np.isnan(view.image_data))
@@ -290,6 +453,40 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # Save / export
     # ------------------------------------------------------------------
+    def _meta_lines(self, cfg: dict, timestamp: str) -> list[str]:
+        profile = self._profile_for(cfg["profile"])
+        outputs = self.app_config.outputs
+        cal = cfg["calibration_um_per_v"]
+        lines = [
+            f"timestamp: {timestamp}",
+            f"mode: {cfg['mode']}",
+            f"profile: {cfg['profile']} (safe range {profile.vmin} to {profile.vmax} V)",
+            f"calibration_um_per_v: {cal}",
+            f"x_range_v: {cfg['x_min']} to {cfg['x_max']}",
+            f"y_range_v: {cfg['y_min']} to {cfg['y_max']}",
+            f"x_range_um: {cfg['x_min'] * cal:.4f} to {cfg['x_max'] * cal:.4f}",
+            f"y_range_um: {cfg['y_min'] * cal:.4f} to {cfg['y_max'] * cal:.4f}",
+            f"points: {cfg['x_points']} x {cfg['y_points']}",
+            f"line_time_s: {cfg['line_time']}",
+            f"lag_delay_samples: {cfg['delay_samples']}",
+            f"x_output_channel: {outputs.x_channel}",
+            f"y_output_channel: {outputs.y_channel}",
+        ]
+        if cfg["mode"] == "3D":
+            lines += [
+                f"z_output_channel: {outputs.z_channel}",
+                f"z_range_v: {cfg['z_min']} to {cfg['z_max']}",
+                f"z_steps: {cfg['z_steps']}",
+            ]
+        return lines
+
+    def _write_3d_meta(self, folder: str, cfg: dict, z_values: list[float]) -> None:
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        lines = self._meta_lines(cfg, timestamp)
+        lines.append("z_values_v: " + ", ".join(f"{z:.4f}" for z in z_values))
+        with open(os.path.join(folder, "meta.txt"), "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n")
+
     def _save_scan_data(self):
         save_dir = self.control_panel.save_directory or os.getcwd()
         try:
@@ -300,28 +497,11 @@ class MainWindow(QMainWindow):
 
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         cfg = self._active_config
-        profile = PROFILES[cfg["profile"]]
-        cal = cfg["calibration_um_per_v"]
-
-        meta_lines = [
-            f"timestamp: {timestamp}",
-            f"profile: {cfg['profile']} (safe range {profile.vmin} to {profile.vmax} V)",
-            f"calibration_um_per_v: {cal}",
-            f"x_range_v: {cfg['x_min']} to {cfg['x_max']}",
-            f"y_range_v: {cfg['y_min']} to {cfg['y_max']}",
-            f"x_range_um: {cfg['x_min'] * cal:.4f} to {cfg['x_max'] * cal:.4f}",
-            f"y_range_um: {cfg['y_min'] * cal:.4f} to {cfg['y_max'] * cal:.4f}",
-            f"points: {cfg['x_points']} x {cfg['y_points']}",
-            f"line_time_s: {cfg['line_time']}",
-            f"lag_delay_samples: {cfg['delay_samples']}",
-            f"fast_axis_channel: {cfg['fast_axis_channel']}",
-            f"slow_axis_channel: {cfg['slow_axis_channel']}",
-        ]
 
         try:
             meta_path = os.path.join(save_dir, f"scan_{timestamp}_meta.txt")
             with open(meta_path, "w", encoding="utf-8") as fh:
-                fh.write("\n".join(meta_lines) + "\n")
+                fh.write("\n".join(self._meta_lines(cfg, timestamp)) + "\n")
 
             saved_files = [os.path.basename(meta_path)]
             for slot in self._active_slots:
@@ -349,12 +529,12 @@ class MainWindow(QMainWindow):
     # Stage positioning (center / full range / jog / click-to-move)
     # ------------------------------------------------------------------
     def center_stage(self):
-        profile = PROFILES[self.control_panel.current_profile_name()]
+        profile = self._profile_for(self.control_panel.current_profile_name())
         mid = (profile.vmin + profile.vmax) / 2.0
         self._move_to_voltage(mid, mid)
 
     def full_range(self):
-        profile = PROFILES[self.control_panel.current_profile_name()]
+        profile = self._profile_for(self.control_panel.current_profile_name())
         self.control_panel.set_full_range(profile.vmin, profile.vmax)
         self.control_panel.set_status("Reset to full range")
 
@@ -366,18 +546,24 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Scan in Progress", "Cannot move the stage while a scan is running.")
             return
 
+        outputs = self.app_config.outputs
+        if outputs.x_channel == 0 or outputs.y_channel == 0:
+            QMessageBox.warning(
+                self, "Outputs Not Configured",
+                "X and Y output channels must be set (Settings → Configure Hardware…).",
+            )
+            return
+
         cfg = self.control_panel.get_scan_config()
-        profile = PROFILES[cfg["profile"]]
+        profile = self._profile_for(cfg["profile"])
         x_v = profile.clip_voltage(x_v)
         y_v = profile.clip_voltage(y_v)
-        fast_channel = cfg["fast_axis_channel"]
-        slow_channel = cfg["slow_axis_channel"]
 
         self.control_panel.set_status(f"Moving to X={x_v:.3f} V, Y={y_v:.3f} V...")
 
         def _do_move():
-            self.daq.setAO_DC(fast_channel, x_v)
-            self.daq.setAO_DC(slow_channel, y_v)
+            self.daq.setAO_DC(outputs.x_channel, x_v)
+            self.daq.setAO_DC(outputs.y_channel, y_v)
             return x_v, y_v
 
         command = QuickCommand(_do_move)
@@ -388,7 +574,7 @@ class MainWindow(QMainWindow):
     def _on_move_done(self, result):
         x_v, y_v = result
         cal = self.control_panel.get_scan_config()["calibration_um_per_v"]
-        self.lbl_position.setText(f"Position: X={x_v:.3f} V ({x_v * cal:.2f} μm), Y={y_v:.3f} V ({y_v * cal:.2f} μm)")
+        self.lbl_position.setText(f"XY: {x_v:.3f}, {y_v:.3f} V ({x_v * cal:.2f}, {y_v * cal:.2f} μm)")
         self.control_panel.set_status(f"Positioned at X={x_v:.3f} V, Y={y_v:.3f} V")
 
     def _on_move_error(self, message: str):
@@ -399,7 +585,7 @@ class MainWindow(QMainWindow):
         if self.control_panel.is_scanning():
             return
         cfg = self.control_panel.get_scan_config()
-        profile = PROFILES[cfg["profile"]]
+        profile = self._profile_for(cfg["profile"])
         cal = cfg["calibration_um_per_v"]
 
         x1_v = profile.clip_voltage(x1_um / cal)
@@ -421,6 +607,31 @@ class MainWindow(QMainWindow):
             return
         cal = self.control_panel.get_scan_config()["calibration_um_per_v"]
         self._move_to_voltage(x_um / cal, y_um / cal)
+
+    # ------------------------------------------------------------------
+    # Find surface
+    # ------------------------------------------------------------------
+    def open_find_surface(self):
+        if self.worker is not None:
+            QMessageBox.warning(self, "Scan in Progress", "Finish or abort the scan before using Find Surface.")
+            return
+        outputs = self.app_config.outputs
+        if not outputs.z_enabled:
+            QMessageBox.information(
+                self, "No Z Output",
+                "Find Surface needs a Z output channel.\nSet one under Settings → Configure Hardware…",
+            )
+            return
+
+        cfg = self.control_panel.get_scan_config()
+        scanner = self._make_scanner(cfg)
+        dialog = FindSurfaceDialog(scanner, outputs.z_channel, self._dark_theme, self)
+        dialog.z_moved.connect(self._on_z_moved)
+        dialog.exec()
+
+    def _on_z_moved(self, z_value: float):
+        self.lbl_z.setText(f"Z: {z_value:.3f} V")
+        self.control_panel.set_status(f"Z parked at {z_value:.3f} V")
 
     # ------------------------------------------------------------------
     # Misc

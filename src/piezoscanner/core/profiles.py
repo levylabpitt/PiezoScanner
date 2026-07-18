@@ -38,7 +38,7 @@ class ScannerProfile:
         return um / self.calibration_um_per_v
 
 
-PROFILES: dict[str, ScannerProfile] = {
+DEFAULT_PROFILES: dict[str, ScannerProfile] = {
     "PSJ": ScannerProfile(
         name="PSJ",
         vmin=0.0,
@@ -57,5 +57,9 @@ PROFILES: dict[str, ScannerProfile] = {
               "Verify before trusting reported micrometer positions.",
     ),
 }
+
+# Back-compat alias: the live profile set now comes from the user's config
+# file (core.config); these defaults seed that file on first run.
+PROFILES = DEFAULT_PROFILES
 
 DEFAULT_PROFILE = "PSJ"

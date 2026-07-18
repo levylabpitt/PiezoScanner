@@ -16,7 +16,7 @@ from typing import Callable, Iterator, Sequence
 
 import numpy as np
 
-from .profiles import PROFILES, ScannerProfile
+from .profiles import DEFAULT_PROFILES, ScannerProfile
 
 
 @dataclass
@@ -43,7 +43,7 @@ class PiezoScanner:
     def __init__(
         self,
         daq,
-        profile: str = "PSJ",
+        profile: ScannerProfile | str = "PSJ",
         fast_axis_channel: int = 11,
         slow_axis_channel: int = 12,
         initial_wait: float = 1,
@@ -51,11 +51,13 @@ class PiezoScanner:
         daq_fs: float = 13000,
         daq_num_samples: int = 1000,
     ):
-        if profile not in PROFILES:
-            raise ValueError(f"Unknown profile '{profile}'. Known profiles: {list(PROFILES)}")
+        if isinstance(profile, str):
+            if profile not in DEFAULT_PROFILES:
+                raise ValueError(f"Unknown profile '{profile}'. Known profiles: {list(DEFAULT_PROFILES)}")
+            profile = DEFAULT_PROFILES[profile]
 
         self.daq = daq
-        self.profile: ScannerProfile = PROFILES[profile]
+        self.profile: ScannerProfile = profile
 
         self.fast_axis_channel = fast_axis_channel
         self.slow_axis_channel = slow_axis_channel
@@ -189,6 +191,60 @@ class PiezoScanner:
         self.daq.setAO_DC(self.fast_axis_channel, x_v)
         self.daq.setAO_DC(self.slow_axis_channel, y_v)
         return x_v, y_v
+
+    # ============================================================
+    # Single-axis sweep (used by Find Surface)
+    # ============================================================
+
+    def sweep_axis(
+        self,
+        channel: int,
+        v_min: float,
+        v_max: float,
+        points: int,
+        sweep_time: float,
+        detector_channels: Sequence[int],
+    ) -> tuple[np.ndarray, dict[int, np.ndarray]]:
+        """Sweep one AO channel linearly from ``v_min`` to ``v_max`` while
+        recording the given detector channels, using the same lock-in sweep
+        mechanism as a scan line.
+
+        Returns ``(axis_values, {channel: signal})``, both resampled onto
+        the ``points`` grid.
+        """
+        self._validate_voltage(v_min)
+        self._validate_voltage(v_max)
+        if not detector_channels:
+            raise ValueError("sweep_axis requires at least one detector channel")
+
+        wave = np.linspace(v_min, v_max, points)
+        config = {
+            "Sweep Time (s)": sweep_time,
+            "Initial Wait (s)": self.initial_wait,
+            "Return to Start": False,
+            "Channels": [
+                {
+                    "Enable?": True,
+                    "Channel": channel,
+                    "Start": 0,
+                    "End": 0,
+                    "Pattern": "Table",
+                    "Table": wave.tolist(),
+                },
+            ],
+        }
+        self.daq.lockin_sweep(config, timeout=sweep_time + self.initial_wait + 30)
+
+        raw = self.read_detectors(detector_channels)
+        save_rate = self.daq_fs / self.daq_num_samples
+        t = np.linspace(0, sweep_time, points)
+
+        signals: dict[int, np.ndarray] = {}
+        for det_channel, trace in raw.items():
+            det_time = np.arange(len(trace)) / save_rate
+            signals[det_channel] = np.interp(t, det_time, trace)
+
+        return wave, signals
 
     # ============================================================
     # Line-by-line scanning (used by the live GUI)

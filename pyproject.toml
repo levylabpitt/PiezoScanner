@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "piezoscanner"
-version = "1.0.0"
+version = "1.1.0"
 description = "FLEX PiezoScanner: PyQt6 controller and live raster-scan viewer for piezo scan stages driven through a Levylab FLEX Lockin."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -14,6 +14,7 @@ dependencies = [
     "PyQt6>=6.6",
     "numpy>=1.24",
     "matplotlib>=3.7",
+    "PyYAML>=6.0",
 ]
 
 # `flex` (the Levylab FLEX instrument framework that provides

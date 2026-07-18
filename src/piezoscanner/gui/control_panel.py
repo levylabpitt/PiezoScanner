@@ -1,6 +1,11 @@
-"""Left-hand control panel: scan configuration, profile/calibration,
-dynamic input-channel manager, save location, stage jog controls, and the
-main scan/pause/abort controls."""
+"""Left-hand control panel: scan configuration (2D/3D), profile and
+calibration, dynamic input-channel manager, save location, stage
+navigation, and the main scan/pause/abort controls.
+
+Output (AO) channel assignments live in the hardware configuration dialog,
+not here — this panel only needs to know whether a Z axis exists so it can
+offer 3D mode.
+"""
 
 from __future__ import annotations
 
@@ -13,8 +18,8 @@ from PyQt6.QtWidgets import (
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
-    QFormLayout,
     QFrame,
+    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -27,7 +32,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from ..core.profiles import PROFILES, DEFAULT_PROFILE
+from ..core.profiles import ScannerProfile
 
 MAX_CHANNELS = 3
 COLORMAPS = ["viridis", "plasma", "inferno", "magma", "cividis", "turbo", "jet", "gray", "hot", "coolwarm", "RdBu_r"]
@@ -112,11 +117,14 @@ class ControlPanel(QWidget):
     browse_directory_requested = pyqtSignal(str)
     profile_changed = pyqtSignal(str)
     channels_changed = pyqtSignal()
+    find_surface_requested = pyqtSignal()
 
-    def __init__(self, parent=None):
+    def __init__(self, profiles: dict[str, ScannerProfile], z_available: bool = False, parent=None):
         super().__init__(parent)
+        self._profiles: dict[str, ScannerProfile] = dict(profiles)
         self._channel_rows: list[ChannelRow] = []
         self._is_scanning = False
+        self._z_available = False
         self.save_directory = os.getcwd()
 
         outer = QVBoxLayout(self)
@@ -130,121 +138,192 @@ class ControlPanel(QWidget):
         body = QWidget()
         scroll.setWidget(body)
         self._layout = QVBoxLayout(body)
-        self._layout.setSpacing(10)
+        self._layout.setSpacing(8)
 
         self._build_scan_config_group()
         self._build_profile_group()
         self._build_channels_group()
         self._build_save_group()
-        self._build_stage_group()
+        self._build_navigation_group()
         self._layout.addStretch(1)
         self._build_scan_control_group()  # pinned below the scroll area
 
         outer.addWidget(self._scan_control_group)
 
+        self.set_z_available(z_available)
         self._update_scan_size_readout()
         self._update_calibration_state()
 
     # ------------------------------------------------------------------
-    # Scan configuration
+    # Scan configuration (dense grid: one row per axis)
     # ------------------------------------------------------------------
     def _build_scan_config_group(self):
-        group = QGroupBox("Scan Configuration")
-        form = QFormLayout(group)
+        group = QGroupBox("Scan")
+        grid = QGridLayout(group)
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(6)
 
-        self.spin_x_points = QSpinBox()
-        self.spin_x_points.setRange(2, 4096)
-        self.spin_x_points.setValue(50)
-        form.addRow("X Pixels (points):", self.spin_x_points)
+        # Row 0: mode + line time
+        grid.addWidget(QLabel("Mode"), 0, 0)
+        self.combo_mode = QComboBox()
+        self.combo_mode.addItems(["2D", "3D"])
+        self.combo_mode.setToolTip("3D steps the Z output through its range, running one 2D scan per level")
+        self.combo_mode.currentTextChanged.connect(self._sync_z_enabled)
+        grid.addWidget(self.combo_mode, 0, 1)
 
-        self.spin_y_points = QSpinBox()
-        self.spin_y_points.setRange(2, 4096)
-        self.spin_y_points.setValue(50)
-        form.addRow("Y Pixels (lines):", self.spin_y_points)
-
+        grid.addWidget(QLabel("Line time"), 0, 3)
         self.spin_line_time = QDoubleSpinBox()
         self.spin_line_time.setRange(0.01, 3600.0)
         self.spin_line_time.setDecimals(2)
         self.spin_line_time.setSuffix(" s")
         self.spin_line_time.setValue(4.0)
-        form.addRow("Time per line:", self.spin_line_time)
+        grid.addWidget(self.spin_line_time, 0, 4)
 
-        self.spin_fast_channel = QSpinBox()
-        self.spin_fast_channel.setRange(1, 64)
-        self.spin_fast_channel.setValue(11)
-        form.addRow("X-axis output channel:", self.spin_fast_channel)
+        # Row 1: pixels + lag
+        grid.addWidget(QLabel("Pixels X×Y"), 1, 0)
+        self.spin_x_points = QSpinBox()
+        self.spin_x_points.setRange(2, 4096)
+        self.spin_x_points.setValue(50)
+        grid.addWidget(self.spin_x_points, 1, 1)
+        self.spin_y_points = QSpinBox()
+        self.spin_y_points.setRange(2, 4096)
+        self.spin_y_points.setValue(50)
+        grid.addWidget(self.spin_y_points, 1, 2)
 
-        self.spin_slow_channel = QSpinBox()
-        self.spin_slow_channel.setRange(1, 64)
-        self.spin_slow_channel.setValue(12)
-        form.addRow("Y-axis output channel:", self.spin_slow_channel)
+        grid.addWidget(QLabel("Lag"), 1, 3)
+        self.spin_delay = QSpinBox()
+        self.spin_delay.setRange(-1000, 1000)
+        self.spin_delay.setValue(0)
+        self.spin_delay.setToolTip("Samples to shift backward lines to correct the bidirectional 'zipper' offset")
+        grid.addWidget(self.spin_delay, 1, 4)
 
-        self.spin_x_min = QDoubleSpinBox()
-        self.spin_x_max = QDoubleSpinBox()
-        self.spin_y_min = QDoubleSpinBox()
-        self.spin_y_max = QDoubleSpinBox()
-        for spin, default in (
-            (self.spin_x_min, 0.0), (self.spin_x_max, 10.0),
-            (self.spin_y_min, 0.0), (self.spin_y_max, 10.0),
-        ):
+        # Rows 2-4: axis ranges, one row each
+        def _v_spin(default: float) -> QDoubleSpinBox:
+            spin = QDoubleSpinBox()
             spin.setRange(-100.0, 100.0)
             spin.setDecimals(3)
             spin.setSuffix(" V")
             spin.setValue(default)
             spin.valueChanged.connect(self._update_scan_size_readout)
+            return spin
 
-        form.addRow("X Min:", self.spin_x_min)
-        form.addRow("X Max:", self.spin_x_max)
-        form.addRow("Y Min:", self.spin_y_min)
-        form.addRow("Y Max:", self.spin_y_max)
+        grid.addWidget(QLabel("X range"), 2, 0)
+        self.spin_x_min = _v_spin(0.0)
+        self.spin_x_max = _v_spin(10.0)
+        grid.addWidget(self.spin_x_min, 2, 1)
+        grid.addWidget(self.spin_x_max, 2, 2)
 
-        self.spin_delay = QSpinBox()
-        self.spin_delay.setRange(-1000, 1000)
-        self.spin_delay.setValue(0)
-        form.addRow("Lag delay (samples):", self.spin_delay)
+        grid.addWidget(QLabel("Y range"), 3, 0)
+        self.spin_y_min = _v_spin(0.0)
+        self.spin_y_max = _v_spin(10.0)
+        grid.addWidget(self.spin_y_min, 3, 1)
+        grid.addWidget(self.spin_y_max, 3, 2)
 
-        self.lbl_scan_size = QLabel("Physical size: -")
+        self._lbl_z_range = QLabel("Z range")
+        grid.addWidget(self._lbl_z_range, 4, 0)
+        self.spin_z_min = _v_spin(0.0)
+        self.spin_z_max = _v_spin(10.0)
+        grid.addWidget(self.spin_z_min, 4, 1)
+        grid.addWidget(self.spin_z_max, 4, 2)
+        self._lbl_z_steps = QLabel("Steps")
+        grid.addWidget(self._lbl_z_steps, 4, 3)
+        self.spin_z_steps = QSpinBox()
+        self.spin_z_steps.setRange(2, 500)
+        self.spin_z_steps.setValue(10)
+        self.spin_z_steps.setToolTip("Number of Z levels (one 2D scan per level)")
+        grid.addWidget(self.spin_z_steps, 4, 4)
+        self._z_widgets = (
+            self._lbl_z_range, self.spin_z_min, self.spin_z_max,
+            self._lbl_z_steps, self.spin_z_steps,
+        )
+
+        # Row 5: physical size readout
+        self.lbl_scan_size = QLabel("")
         self.lbl_scan_size.setProperty("muted", True)
-        form.addRow("", self.lbl_scan_size)
+        grid.addWidget(self.lbl_scan_size, 5, 0, 1, 5)
 
+        grid.setColumnStretch(1, 1)
+        grid.setColumnStretch(2, 1)
+        grid.setColumnStretch(4, 1)
         self._layout.addWidget(group)
 
     def _update_scan_size_readout(self, *_):
         cal = self._current_calibration()
         w_um = abs(self.spin_x_max.value() - self.spin_x_min.value()) * cal
         h_um = abs(self.spin_y_max.value() - self.spin_y_min.value()) * cal
-        self.lbl_scan_size.setText(f"Physical size: {w_um:.2f} x {h_um:.2f} um  (at {cal:g} um/V)")
+        self.lbl_scan_size.setText(f"{w_um:.2f} × {h_um:.2f} um  (at {cal:g} um/V)")
+
+    # ------------------------------------------------------------------
+    # 2D/3D mode availability
+    # ------------------------------------------------------------------
+    def set_z_available(self, available: bool):
+        """Enable/disable 3D mode based on whether a Z output channel is
+        configured. The Z row is hidden entirely when unavailable."""
+        self._z_available = available
+        model = self.combo_mode.model()
+        item = model.item(1)
+        if item is not None:
+            item.setEnabled(available)
+        if not available and self.combo_mode.currentIndex() == 1:
+            self.combo_mode.setCurrentIndex(0)
+        for widget in self._z_widgets:
+            widget.setVisible(available)
+        self._sync_z_enabled()
+
+    def _sync_z_enabled(self, *_):
+        is_3d = self._z_available and self.combo_mode.currentText() == "3D"
+        for widget in (self.spin_z_min, self.spin_z_max, self.spin_z_steps):
+            widget.setEnabled(is_3d)
 
     # ------------------------------------------------------------------
     # Profile & calibration
     # ------------------------------------------------------------------
     def _build_profile_group(self):
         group = QGroupBox("Profile && Calibration")
-        form = QFormLayout(group)
+        grid = QGridLayout(group)
+        grid.setHorizontalSpacing(8)
 
+        grid.addWidget(QLabel("Profile"), 0, 0)
         self.combo_profile = QComboBox()
-        self.combo_profile.addItems(list(PROFILES.keys()))
-        self.combo_profile.setCurrentText(DEFAULT_PROFILE)
+        self.combo_profile.addItems(list(self._profiles.keys()))
         self.combo_profile.currentTextChanged.connect(self._on_profile_changed)
-        form.addRow("Profile:", self.combo_profile)
+        grid.addWidget(self.combo_profile, 0, 1)
 
+        grid.addWidget(QLabel("Calibration"), 0, 2)
         self.spin_calibration = QDoubleSpinBox()
         self.spin_calibration.setRange(0.001, 10000.0)
         self.spin_calibration.setDecimals(4)
         self.spin_calibration.setSuffix(" um/V")
         self.spin_calibration.valueChanged.connect(self._update_scan_size_readout)
-        form.addRow("Calibration:", self.spin_calibration)
+        grid.addWidget(self.spin_calibration, 0, 3)
 
         self.lbl_uncalibrated = QLabel()
         self.lbl_uncalibrated.setWordWrap(True)
         self.lbl_uncalibrated.setStyleSheet("color: #d9a441; font-style: italic;")
-        form.addRow("", self.lbl_uncalibrated)
+        grid.addWidget(self.lbl_uncalibrated, 1, 0, 1, 4)
 
+        grid.setColumnStretch(1, 1)
+        grid.setColumnStretch(3, 1)
         self._layout.addWidget(group)
         self._on_profile_changed(self.combo_profile.currentText())
 
+    def set_profiles(self, profiles: dict[str, ScannerProfile]):
+        """Replace the available profiles (after a config change),
+        preserving the current selection when it still exists."""
+        self._profiles = dict(profiles)
+        current = self.combo_profile.currentText()
+        self.combo_profile.blockSignals(True)
+        self.combo_profile.clear()
+        self.combo_profile.addItems(list(self._profiles.keys()))
+        if current in self._profiles:
+            self.combo_profile.setCurrentText(current)
+        self.combo_profile.blockSignals(False)
+        self._on_profile_changed(self.combo_profile.currentText())
+
     def _on_profile_changed(self, name: str):
-        profile = PROFILES[name]
+        profile = self._profiles.get(name)
+        if profile is None:
+            return
         self.spin_calibration.blockSignals(True)
         self.spin_calibration.setValue(profile.calibration_um_per_v)
         self.spin_calibration.blockSignals(False)
@@ -253,8 +332,8 @@ class ControlPanel(QWidget):
         self.profile_changed.emit(name)
 
     def _update_calibration_state(self):
-        profile = PROFILES[self.combo_profile.currentText()]
-        if not profile.calibrated:
+        profile = self._profiles.get(self.combo_profile.currentText())
+        if profile is not None and not profile.calibrated:
             self.lbl_uncalibrated.setText(f"⚠ Uncalibrated profile — {profile.notes}")
             self.lbl_uncalibrated.setVisible(True)
         else:
@@ -347,7 +426,7 @@ class ControlPanel(QWidget):
     # ------------------------------------------------------------------
     def _build_save_group(self):
         group = QGroupBox("Save Location")
-        layout = QVBoxLayout(group)
+        layout = QHBoxLayout(group)
 
         self.btn_browse = QPushButton("Browse...")
         self.btn_browse.clicked.connect(self.browse_directory)
@@ -356,7 +435,7 @@ class ControlPanel(QWidget):
         self.lbl_directory = QLabel()
         self.lbl_directory.setProperty("muted", True)
         self.lbl_directory.setWordWrap(True)
-        layout.addWidget(self.lbl_directory)
+        layout.addWidget(self.lbl_directory, 1)
 
         self._layout.addWidget(group)
         self._update_directory_label()
@@ -373,47 +452,57 @@ class ControlPanel(QWidget):
 
     def _update_directory_label(self):
         path = self.save_directory
-        shown = path if len(path) <= 42 else f"...{path[-39:]}"
-        self.lbl_directory.setText(f"Dir: {shown}")
+        shown = path if len(path) <= 40 else f"...{path[-37:]}"
+        self.lbl_directory.setText(shown)
 
     # ------------------------------------------------------------------
-    # Stage jog controls
+    # Navigation (stage moves + find surface)
     # ------------------------------------------------------------------
-    def _build_stage_group(self):
-        group = QGroupBox("Stage Adjustments")
+    def _build_navigation_group(self):
+        group = QGroupBox("Navigation")
         layout = QVBoxLayout(group)
+        layout.setSpacing(6)
 
+        row1 = QHBoxLayout()
         self.btn_center = QPushButton("Center Stage")
         self.btn_center.setToolTip("Move to the midpoint of the active profile's safe voltage range")
         self.btn_center.clicked.connect(self.center_stage_requested.emit)
-        layout.addWidget(self.btn_center)
+        row1.addWidget(self.btn_center)
 
-        self.btn_full_range = QPushButton("Reset to Full Range")
-        self.btn_full_range.setToolTip("Reset X/Y Min/Max to the active profile's safe voltage range")
+        self.btn_full_range = QPushButton("Full Range")
+        self.btn_full_range.setToolTip("Reset scan ranges to the active profile's safe voltage range")
         self.btn_full_range.clicked.connect(self.full_range_requested.emit)
-        layout.addWidget(self.btn_full_range)
+        row1.addWidget(self.btn_full_range)
+        layout.addLayout(row1)
 
-        jog_form = QFormLayout()
+        row2 = QHBoxLayout()
+        row2.addWidget(QLabel("Go to"))
         self.spin_move_x = QDoubleSpinBox()
         self.spin_move_y = QDoubleSpinBox()
         for spin in (self.spin_move_x, self.spin_move_y):
             spin.setRange(-100.0, 100.0)
             spin.setDecimals(3)
             spin.setSuffix(" V")
-        jog_form.addRow("Go to X:", self.spin_move_x)
-        jog_form.addRow("Go to Y:", self.spin_move_y)
-        layout.addLayout(jog_form)
-
+            row2.addWidget(spin)
         self.btn_move = QPushButton("Move")
         self.btn_move.clicked.connect(
             lambda: self.move_to_requested.emit(self.spin_move_x.value(), self.spin_move_y.value())
         )
-        layout.addWidget(self.btn_move)
+        row2.addWidget(self.btn_move)
+        layout.addLayout(row2)
+
+        self.btn_find_surface = QPushButton("Find Surface…")
+        self.btn_find_surface.setToolTip("Sweep the Z output while recording a signal channel to locate the surface")
+        self.btn_find_surface.clicked.connect(self.find_surface_requested.emit)
+        layout.addWidget(self.btn_find_surface)
 
         self._layout.addWidget(group)
 
     def set_full_range(self, vmin: float, vmax: float):
         self.set_range(vmin, vmax, vmin, vmax)
+        if self._z_available:
+            self.spin_z_min.setValue(vmin)
+            self.spin_z_max.setValue(vmax)
 
     def set_range(self, x_min: float, x_max: float, y_min: float, y_max: float):
         self.spin_x_min.setValue(x_min)
@@ -449,13 +538,14 @@ class ControlPanel(QWidget):
         self.progress_bar.setRange(0, 100)
         layout.addWidget(self.progress_bar)
 
+        status_row = QHBoxLayout()
         self.lbl_status = QLabel("Status: Idle")
         self.lbl_status.setStyleSheet("font-weight: 600;")
-        layout.addWidget(self.lbl_status)
-
+        status_row.addWidget(self.lbl_status, 1)
         self.lbl_eta = QLabel("")
         self.lbl_eta.setProperty("muted", True)
-        layout.addWidget(self.lbl_eta)
+        status_row.addWidget(self.lbl_eta)
+        layout.addLayout(status_row)
 
     def _on_start_abort_clicked(self):
         if self._is_scanning:
@@ -475,20 +565,26 @@ class ControlPanel(QWidget):
         self._set_inputs_enabled(not scanning)
 
     def _set_inputs_enabled(self, enabled: bool):
-        # Stage jog controls (center/full-range/manual move) are included here
+        # Navigation controls (center/full-range/move/find-surface) are locked
         # too: repositioning the stage mid-sweep would corrupt the running scan.
         for widget in (
+            self.combo_mode,
             self.spin_x_points, self.spin_y_points, self.spin_line_time,
-            self.spin_fast_channel, self.spin_slow_channel,
             self.spin_x_min, self.spin_x_max, self.spin_y_min, self.spin_y_max,
             self.spin_delay, self.combo_profile, self.spin_calibration,
             self.btn_add_channel,
             self.btn_center, self.btn_full_range,
             self.spin_move_x, self.spin_move_y, self.btn_move,
+            self.btn_find_surface,
         ):
             widget.setEnabled(enabled)
         for row in self._channel_rows:
             row.setEnabled(enabled)
+        if enabled:
+            self._sync_z_enabled()
+        else:
+            for widget in (self.spin_z_min, self.spin_z_max, self.spin_z_steps):
+                widget.setEnabled(False)
 
     def set_status(self, text: str):
         self.lbl_status.setText(f"Status: {text}")
@@ -500,19 +596,21 @@ class ControlPanel(QWidget):
         self.lbl_eta.setText(text)
 
     # ------------------------------------------------------------------
-    # Validated scan configuration for MainWindow
+    # Scan configuration for MainWindow
     # ------------------------------------------------------------------
     def get_scan_config(self) -> dict:
         return dict(
+            mode=self.combo_mode.currentText(),
             x_points=self.spin_x_points.value(),
             y_points=self.spin_y_points.value(),
             line_time=self.spin_line_time.value(),
-            fast_axis_channel=self.spin_fast_channel.value(),
-            slow_axis_channel=self.spin_slow_channel.value(),
             x_min=self.spin_x_min.value(),
             x_max=self.spin_x_max.value(),
             y_min=self.spin_y_min.value(),
             y_max=self.spin_y_max.value(),
+            z_min=self.spin_z_min.value(),
+            z_max=self.spin_z_max.value(),
+            z_steps=self.spin_z_steps.value(),
             delay_samples=self.spin_delay.value(),
             profile=self.combo_profile.currentText(),
             calibration_um_per_v=self.spin_calibration.value(),
@@ -525,19 +623,26 @@ class ControlPanel(QWidget):
             "x_points": self.spin_x_points,
             "y_points": self.spin_y_points,
             "line_time": self.spin_line_time,
-            "fast_axis_channel": self.spin_fast_channel,
-            "slow_axis_channel": self.spin_slow_channel,
             "x_min": self.spin_x_min,
             "x_max": self.spin_x_max,
             "y_min": self.spin_y_min,
             "y_max": self.spin_y_max,
+            "z_min": self.spin_z_min,
+            "z_max": self.spin_z_max,
+            "z_steps": self.spin_z_steps,
             "delay_samples": self.spin_delay,
         }
         for key, widget in mapping.items():
             if key in cfg and cfg[key] is not None:
                 widget.setValue(cfg[key])
 
-        if cfg.get("profile") in PROFILES:
+        mode = cfg.get("mode")
+        if mode == "3D" and self._z_available:
+            self.combo_mode.setCurrentText("3D")
+        elif mode == "2D":
+            self.combo_mode.setCurrentText("2D")
+
+        if cfg.get("profile") in self._profiles:
             self.combo_profile.setCurrentText(cfg["profile"])
         if cfg.get("calibration_um_per_v") is not None:
             self.spin_calibration.setValue(float(cfg["calibration_um_per_v"]))

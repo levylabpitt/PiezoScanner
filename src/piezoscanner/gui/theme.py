@@ -241,3 +241,13 @@ def style_figure(fig, ax, dark: bool, cbar=None) -> None:
         cbar.ax.yaxis.label.set_color(colors["text"])
         cbar.ax.tick_params(colors=colors["text"])
         cbar.outline.set_edgecolor(colors["grid"])
+
+
+def style_axes3d(ax, dark: bool) -> None:
+    """Apply theme colors to a mplot3d Axes3D in place."""
+    colors = matplotlib_colors(dark)
+    ax.set_facecolor((0, 0, 0, 0))
+    for axis in (ax.xaxis, ax.yaxis, ax.zaxis):
+        axis.label.set_color(colors["text"])
+        axis.set_pane_color((0, 0, 0, 0))
+    ax.tick_params(colors=colors["text"])
