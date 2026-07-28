@@ -21,13 +21,19 @@ from .profiles import DEFAULT_PROFILES, ScannerProfile
 
 @dataclass
 class ScanLineResult:
-    """One completed raster line, forward *or* backward, already
-    flip/lag-corrected so consumers can drop it straight into a row of the
-    output image."""
+    """One completed raster line (always scanned in the forward direction),
+    lag-corrected so consumers can drop it straight into a row of the
+    output image.
+
+    ``line_index`` counts acquisition order (0 = first line scanned);
+    ``row_index`` is where the line belongs in the image (0 = y_min row),
+    so images keep the same orientation whether the slow axis scanned
+    up or down.
+    """
 
     line_index: int
+    row_index: int
     y_value: float
-    forward: bool
     pixels: dict[int, np.ndarray]  # channel number -> pixel values
 
 
@@ -97,20 +103,32 @@ class PiezoScanner:
     # Full-frame raster generation (single big sweep)
     # ============================================================
 
-    def generate_raster(self, x_points, y_points, scan_time, x_min=0, x_max=1, y_min=0, y_max=1):
+    def generate_raster(
+        self, x_points, y_points, scan_time,
+        x_min=0, x_max=1, y_min=0, y_max=1,
+        flyback_fraction=0.05,
+    ):
         """Populate ``x_wave``/``y_wave``/``time`` for one continuous
-        triangular raster covering the whole frame in a single DAQ sweep."""
+        unidirectional raster covering the whole frame in a single DAQ
+        sweep: each line ramps forward (x_min → x_max) then flies back to
+        x_min in a short segment taking ``flyback_fraction`` of the line's
+        table points. Only the forward portion of each line carries data.
+
+        Note the GUI does not use this — it scans line-by-line via
+        :meth:`scan_lines`; this is for headless/scripted single-sweep use.
+        """
         for v in (x_min, x_max, y_min, y_max):
             self._validate_voltage(v)
 
+        n_flyback = max(1, int(round(x_points * flyback_fraction)))
         x_wave: list[float] = []
         y_wave: list[float] = []
 
         y_levels = np.linspace(y_min, y_max, y_points)
-        for line, y in enumerate(y_levels):
-            x_line = np.linspace(x_min, x_max, x_points) if line % 2 == 0 else np.linspace(x_max, x_min, x_points)
-            x_wave.extend(x_line)
-            y_wave.extend(np.ones(x_points) * y)
+        for y in y_levels:
+            x_wave.extend(np.linspace(x_min, x_max, x_points))
+            x_wave.extend(np.linspace(x_max, x_min, n_flyback + 1)[1:])
+            y_wave.extend(np.full(x_points + n_flyback, y))
 
         self.x_wave = np.asarray(x_wave)
         self.y_wave = np.asarray(y_wave)
@@ -261,14 +279,29 @@ class PiezoScanner:
         y_max: float,
         detector_channels: Sequence[int],
         delay_samples: int = 0,
+        slow_axis_down: bool = False,
         should_abort: Callable[[], bool] | None = None,
     ) -> Iterator[ScanLineResult]:
-        """Scan one line at a time, yielding a fully-corrected
-        :class:`ScanLineResult` as each line completes.
+        """Scan one line at a time, yielding a :class:`ScanLineResult` as
+        each line completes.
+
+        Scanning is unidirectional: every line is acquired on the forward
+        (x_min → x_max) pass only, then the fast axis flies back to x_min
+        with a direct DC jump before the next line. The next line's sweep
+        holds the stage at x_min for ``initial_wait`` before ramping, which
+        doubles as post-flyback settle time. This avoids the forward/backward
+        misalignment ("zipper") artifacts of bidirectional collection, so no
+        line flipping or per-direction lag correction is needed —
+        ``delay_samples`` is applied as one identical shift to every line.
+
+        ``slow_axis_down`` picks the slow-axis direction: False steps Y from
+        y_min up to y_max ("scan up"), True steps from y_max down to y_min
+        ("scan down"). Either way each result's ``row_index`` places the
+        line at its true Y position in the image (row 0 = y_min).
 
         This is the single source of truth for line-by-line acquisition —
         both the GUI worker and any headless/scripted use should call this
-        instead of re-implementing the raster/flip/lag-correction logic.
+        instead of re-implementing the raster/lag-correction logic.
 
         ``should_abort`` is polled between lines; if it returns True the
         generator stops (no partial line is yielded).
@@ -279,18 +312,16 @@ class PiezoScanner:
             raise ValueError("scan_lines requires at least one detector channel")
 
         y_levels = np.linspace(y_min, y_max, y_points)
+        if slow_axis_down:
+            y_levels = y_levels[::-1]
         save_rate = self.daq_fs / self.daq_num_samples
 
         for line_idx, y_val in enumerate(y_levels):
             if should_abort is not None and should_abort():
                 return
 
-            forward = line_idx % 2 == 0
-            x_traj = np.linspace(x_min, x_max, x_points) if forward else np.linspace(x_max, x_min, x_points)
-            y_traj = np.full(x_points, y_val)
-
-            self.x_wave = x_traj
-            self.y_wave = y_traj
+            self.x_wave = np.linspace(x_min, x_max, x_points)
+            self.y_wave = np.full(x_points, y_val)
             self.time = np.linspace(0, line_time, x_points)
             self.x_points = x_points
             self.y_points = 1
@@ -299,21 +330,21 @@ class PiezoScanner:
             self.run()
             raw = self.read_detectors(detector_channels)
 
+            # Fly back to the line start immediately so the piezo has the
+            # whole readout/plotting gap plus the next sweep's initial wait
+            # to settle at x_min.
+            self.daq.setAO_DC(self.fast_axis_channel, x_min)
+
             pixels: dict[int, np.ndarray] = {}
             for channel, raw_line in raw.items():
                 det_time = np.arange(len(raw_line)) / save_rate
                 line_pixels = np.interp(self.time, det_time, raw_line)
-
-                if not forward:
-                    line_pixels = np.flip(line_pixels)
-                    if delay_samples:
-                        line_pixels = np.roll(line_pixels, delay_samples)
-                elif delay_samples:
+                if delay_samples:
                     line_pixels = np.roll(line_pixels, -delay_samples)
-
                 pixels[channel] = line_pixels
 
-            yield ScanLineResult(line_index=line_idx, y_value=y_val, forward=forward, pixels=pixels)
+            row_index = (y_points - 1 - line_idx) if slow_axis_down else line_idx
+            yield ScanLineResult(line_index=line_idx, row_index=row_index, y_value=y_val, pixels=pixels)
 
     # ============================================================
     # Utilities

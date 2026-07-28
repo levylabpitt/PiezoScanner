@@ -43,6 +43,7 @@ class ScanWorker(QThread):
         y_max: float,
         detector_channels: Sequence[int],
         delay_samples: int = 0,
+        slow_axis_down: bool = False,
         z_values: Sequence[float] | None = None,
         z_channel: int = 0,
         parent=None,
@@ -58,6 +59,7 @@ class ScanWorker(QThread):
         self.y_max = y_max
         self.detector_channels = list(detector_channels)
         self.delay_samples = delay_samples
+        self.slow_axis_down = slow_axis_down
         self.z_values = list(z_values) if z_values is not None else None
         self.z_channel = z_channel
 
@@ -101,6 +103,7 @@ class ScanWorker(QThread):
                     y_max=self.y_max,
                     detector_channels=self.detector_channels,
                     delay_samples=self.delay_samples,
+                    slow_axis_down=self.slow_axis_down,
                     should_abort=self._should_abort,
                 )
                 for result in lines:

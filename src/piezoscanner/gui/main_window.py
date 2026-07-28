@@ -117,10 +117,15 @@ class MainWindow(QMainWindow):
         file_menu.addAction(act_exit)
 
         scan_menu = menu_bar.addMenu("&Scan")
-        self.act_start = QAction("Start Scan", self)
-        self.act_start.setShortcut(QKeySequence("Ctrl+Return"))
-        self.act_start.triggered.connect(self.start_scan)
-        scan_menu.addAction(self.act_start)
+        self.act_scan_up = QAction("Scan Up", self)
+        self.act_scan_up.setShortcut(QKeySequence("Ctrl+Return"))
+        self.act_scan_up.triggered.connect(lambda: self.start_scan(False))
+        scan_menu.addAction(self.act_scan_up)
+
+        self.act_scan_down = QAction("Scan Down", self)
+        self.act_scan_down.setShortcut(QKeySequence("Ctrl+Shift+Return"))
+        self.act_scan_down.triggered.connect(lambda: self.start_scan(True))
+        scan_menu.addAction(self.act_scan_down)
 
         self.act_abort = QAction("Abort Scan", self)
         self.act_abort.setShortcut(QKeySequence("Esc"))
@@ -245,11 +250,12 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # Scan lifecycle
     # ------------------------------------------------------------------
-    def start_scan(self):
+    def start_scan(self, slow_axis_down: bool = False):
         if self.worker is not None:
             return
 
         cfg = self.control_panel.get_scan_config()
+        cfg["slow_axis_down"] = slow_axis_down
         outputs = self.app_config.outputs
 
         if outputs.x_channel == 0 or outputs.y_channel == 0:
@@ -340,6 +346,7 @@ class MainWindow(QMainWindow):
             y_max=cfg["y_max"],
             detector_channels=channel_numbers,
             delay_samples=cfg["delay_samples"],
+            slow_axis_down=slow_axis_down,
             z_values=z_values,
             z_channel=outputs.z_channel,
         )
@@ -352,7 +359,8 @@ class MainWindow(QMainWindow):
         self.worker.error_occurred.connect(self._on_scan_error)
 
         self.control_panel.set_scanning_state(True)
-        self.act_start.setEnabled(False)
+        self.act_scan_up.setEnabled(False)
+        self.act_scan_down.setEnabled(False)
         self.act_abort.setEnabled(True)
         self._scan_start_time = time.monotonic()
         self._elapsed_timer.start()
@@ -369,7 +377,7 @@ class MainWindow(QMainWindow):
 
     def _on_line_ready(self, slice_index: int, result: ScanLineResult):
         for channel_number, pixels in result.pixels.items():
-            self.plot_panel.update_line(channel_number, result.line_index, pixels)
+            self.plot_panel.update_line(channel_number, result.row_index, pixels)
 
         if self._active_config is not None:
             self._lines_done += 1
@@ -409,7 +417,8 @@ class MainWindow(QMainWindow):
         self._elapsed_timer.stop()
         self._scan_start_time = None
         self.control_panel.set_scanning_state(False)
-        self.act_start.setEnabled(True)
+        self.act_scan_up.setEnabled(True)
+        self.act_scan_down.setEnabled(True)
         self.act_abort.setEnabled(False)
         self.control_panel.set_eta("")
 
@@ -467,6 +476,7 @@ class MainWindow(QMainWindow):
             f"x_range_um: {cfg['x_min'] * cal:.4f} to {cfg['x_max'] * cal:.4f}",
             f"y_range_um: {cfg['y_min'] * cal:.4f} to {cfg['y_max'] * cal:.4f}",
             f"points: {cfg['x_points']} x {cfg['y_points']}",
+            f"slow_axis_direction: {'down (y_max -> y_min)' if cfg.get('slow_axis_down') else 'up (y_min -> y_max)'}",
             f"line_time_s: {cfg['line_time']}",
             f"lag_delay_samples: {cfg['delay_samples']}",
             f"x_output_channel: {outputs.x_channel}",

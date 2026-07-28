@@ -111,6 +111,16 @@ before a scan.
 
 ## A couple of things worth knowing
 
+- Scanning is one-directional: data is only collected on the forward
+  (x_min → x_max) pass of each line, then the stage snaps back and settles
+  before the next line. Collecting in both directions looked faster but
+  the forward/backward misalignment put zipper artifacts in the images.
+  The Lag setting now just shifts every line by the same amount (leave at
+  0 unless you see a constant offset).
+- Scan Up vs Scan Down picks which way the slow (Y) axis steps: up goes
+  y_min → y_max, down goes y_max → y_min. Either way the image (and the
+  saved files) come out in the same orientation — lines are placed at
+  their true Y position, not in acquisition order.
 - The PI profile's calibration (1 um/V) is a placeholder — it hasn't
   actually been measured yet. PSJ's is confirmed at 8 um/V. You can type a
   real value into the Calibration field in the GUI for a one-off session,

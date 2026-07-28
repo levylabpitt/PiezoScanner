@@ -108,7 +108,7 @@ class ChannelRow(QWidget):
 
 class ControlPanel(QWidget):
     # --- action signals consumed by MainWindow ---
-    start_scan_requested = pyqtSignal()
+    start_scan_requested = pyqtSignal(bool)  # slow_axis_down
     abort_scan_requested = pyqtSignal()
     pause_toggled = pyqtSignal(bool)
     center_stage_requested = pyqtSignal()
@@ -194,7 +194,7 @@ class ControlPanel(QWidget):
         self.spin_delay = QSpinBox()
         self.spin_delay.setRange(-1000, 1000)
         self.spin_delay.setValue(0)
-        self.spin_delay.setToolTip("Samples to shift backward lines to correct the bidirectional 'zipper' offset")
+        self.spin_delay.setToolTip("Samples to shift every line by, to correct constant acquisition lag (usually 0)")
         grid.addWidget(self.spin_delay, 1, 4)
 
         # Rows 2-4: axis ranges, one row each
@@ -522,11 +522,26 @@ class ControlPanel(QWidget):
         layout.setContentsMargins(0, 8, 0, 0)
 
         row = QHBoxLayout()
-        self.btn_start_abort = QPushButton("START SCAN")
-        self.btn_start_abort.setObjectName("primaryAction")
-        self.btn_start_abort.setMinimumHeight(38)
-        self.btn_start_abort.clicked.connect(self._on_start_abort_clicked)
-        row.addWidget(self.btn_start_abort, 3)
+        self.btn_scan_up = QPushButton("▲ SCAN UP")
+        self.btn_scan_up.setObjectName("primaryAction")
+        self.btn_scan_up.setMinimumHeight(38)
+        self.btn_scan_up.setToolTip("Scan with the slow axis stepping from Y min up to Y max")
+        self.btn_scan_up.clicked.connect(lambda: self.start_scan_requested.emit(False))
+        row.addWidget(self.btn_scan_up, 3)
+
+        self.btn_scan_down = QPushButton("▼ SCAN DOWN")
+        self.btn_scan_down.setObjectName("primaryAction")
+        self.btn_scan_down.setMinimumHeight(38)
+        self.btn_scan_down.setToolTip("Scan with the slow axis stepping from Y max down to Y min")
+        self.btn_scan_down.clicked.connect(lambda: self.start_scan_requested.emit(True))
+        row.addWidget(self.btn_scan_down, 3)
+
+        self.btn_abort = QPushButton("ABORT SCAN")
+        self.btn_abort.setObjectName("dangerAction")
+        self.btn_abort.setMinimumHeight(38)
+        self.btn_abort.setVisible(False)
+        self.btn_abort.clicked.connect(self.abort_scan_requested.emit)
+        row.addWidget(self.btn_abort, 6)
 
         self.chk_pause = QCheckBox("Pause")
         self.chk_pause.setEnabled(False)
@@ -547,18 +562,11 @@ class ControlPanel(QWidget):
         status_row.addWidget(self.lbl_eta)
         layout.addLayout(status_row)
 
-    def _on_start_abort_clicked(self):
-        if self._is_scanning:
-            self.abort_scan_requested.emit()
-        else:
-            self.start_scan_requested.emit()
-
     def set_scanning_state(self, scanning: bool):
         self._is_scanning = scanning
-        self.btn_start_abort.setText("ABORT SCAN" if scanning else "START SCAN")
-        self.btn_start_abort.setObjectName("dangerAction" if scanning else "primaryAction")
-        self.btn_start_abort.style().unpolish(self.btn_start_abort)
-        self.btn_start_abort.style().polish(self.btn_start_abort)
+        self.btn_scan_up.setVisible(not scanning)
+        self.btn_scan_down.setVisible(not scanning)
+        self.btn_abort.setVisible(scanning)
         self.chk_pause.setEnabled(scanning)
         if not scanning:
             self.chk_pause.setChecked(False)
