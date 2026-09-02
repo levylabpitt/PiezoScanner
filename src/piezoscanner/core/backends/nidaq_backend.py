@@ -38,7 +38,11 @@ import numpy as np
 
 from .base import ScannerBackend
 
-DEFAULT_SAMPLE_RATE = 13_000.0
+# Matches nidaqstudio's own default rather than the old Lockin's daq_fs
+# (13000, a leftover from that instrument with no bearing on this one) --
+# see run_scan_lines for why this, not the card's max rate, is what
+# actually governs how short Settle can safely go in continuous mode.
+DEFAULT_SAMPLE_RATE = 51_200.0
 
 # run_scan_lines' continuous mode needs the queued output buffer (whatever
 # chunk_samples * buffer_chunks is already configured -- deliberately not

@@ -162,25 +162,41 @@ any real network hop): in a simulated-latency test at 20 ms/call, a
 This needs Settle to be long enough for a live Y update to land reliably:
 roughly `Settle ≳ 2 × chunk_samples × buffer_chunks / sample_rate` seconds,
 using **whatever nidaqstudio's own output buffer is currently configured
-to** (not shrunk by this app — a thin buffer gives more timing margin, but
-real hardware needs real margin against normal OS/driver scheduling
-jitter, or the output task can underflow and the acquisition stalls; the
-simulator has no such pressure, so this only bites on real hardware). At
-nidaqstudio's stock defaults (`chunk_samples=2048`, `buffer_chunks=4`) that
-works out to roughly 1.3 s at 13000 Sa/s — so continuous mode won't
-actually engage until Settle clears that, and the app falls back to the
-same one-sweep-per-line approach Lockin uses below it. Falling back is
-always correct, just not as fast.
+to** (not shrunk by this app). At nidaqstudio's stock defaults
+(`chunk_samples=2048`, `buffer_chunks=4`, `sample_rate=51200`) that works
+out to roughly 160 ms — so Settle needs to clear that for continuous mode
+to actually engage; below it, the app falls back to the same
+one-sweep-per-line approach Lockin uses. Falling back is always correct,
+just not as fast.
 
-To get continuous mode at a *shorter* Settle, lower `chunk_samples`/
-`buffer_chunks` in nidaqstudio itself (its own GUI, or
-`rig.set_timing(chunk_samples=..., buffer_chunks=...)`) rather than
-lowering Settle — and do it gradually, watching nidaqstudio's own
-underflow counter while running real scans, since that's the actual limit
-on how far it can go on your specific hardware. Raising the sample rate
-also helps, and is otherwise cheap here: unlike the old per-line approach,
-the continuous path never re-sends a per-sample table, so a higher rate
-doesn't cost more network payload.
+**Why this isn't a hardware speed limit.** nidaqstudio runs continuous AO
+with hardware regeneration *disabled*, specifically so a live parameter
+change (our per-line Y update) actually takes effect instead of being
+masked by a looping onboard buffer. That means a background thread has to
+keep re-filling a real, finite driver buffer — sized as
+`chunk_samples × buffer_chunks` samples — with nothing to fall back on if
+it's late. The time that buffer represents is the actual margin against
+normal OS/driver scheduling jitter before the card underflows and the
+acquisition stalls (the simulator has no such pressure, so this only bites
+on real hardware). That margin is a **software buffering choice**,
+unrelated to how fast the card's converters can physically run — a
+4461 rated for ~200 kSa/s doesn't change it, because the limit isn't the
+converter, it's this queue.
+
+Two knobs move that margin, and they trade off identically — shrinking
+either one shrinks both the Settle requirement *and* the real safety
+margin against underflow by the same proportion:
+
+- `chunk_samples` / `buffer_chunks` in nidaqstudio itself (its own GUI, or
+  `rig.set_timing(chunk_samples=..., buffer_chunks=...)`).
+- This app's own nidaqstudio sample rate (Settings → Configure Hardware) —
+  raising it shrinks the same buffer's time depth just as lowering
+  `chunk_samples`/`buffer_chunks` would, not more safely.
+
+There's no lever here that shortens Settle for free. Change either one
+gradually and watch nidaqstudio's own underflow counter while running real
+scans — that's the actual floor on your specific hardware, and it isn't
+something derivable from a spec sheet.
 
 Under the hood, this app holds X/Y/Z continuously at their last commanded
 voltage between sweeps (so the stage doesn't drift back to 0 V), and folds
