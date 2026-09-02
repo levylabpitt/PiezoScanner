@@ -3,8 +3,9 @@
 PyQt6 app for driving a piezo scan stage and grabbing raster-scan images
 off up to 3 detector channels. Supports plain 2D scans and 3D stacks (a 2D
 scan at each Z level), plus a find-surface tool for locating the sample
-along Z. The hardware backend is switchable — either the Levylab FLEX
-Multichannel Lockin, or an NI PXIe rig driven through `nidaqstudio`.
+along Z. The hardware backend is switchable — the Levylab FLEX
+Multichannel Lockin, an NI PXIe rig driven through `nidaqstudio`, or the
+same NI cards driven directly through NI-DAQmx.
 
 This replaces the old `app.py` / `piezoscanner.py` scripts. Same basic idea,
 but rewritten as a proper installable package: scanning runs on its own
@@ -17,16 +18,19 @@ matter what profile/range you had set).
 
 - Python 3.10+
 - PyQt6, numpy, matplotlib, PyYAML — these get installed automatically
-- One of the two hardware backends, if you want to talk to real hardware.
-  Both are internal packages, not on PyPI, so you install whichever one you
-  need separately into the same environment. Without either, the app just
-  starts in Simulation Mode — useful for checking the UI works before
-  you're next to the actual stage.
-  - **Lockin backend**: `flex` (the Levylab FLEX framework).
-  - **nidaqstudio backend**: the `nidaqstudio` Python package. Its own GUI
-    or headless server (`python -m nidaqstudio`) runs separately — often on
-    a different machine than this app — and this package just needs its
-    client library importable to talk to that server over the network.
+- One of the three hardware backends, if you want to talk to real
+  hardware. Install whichever one you need into the same environment.
+  Without any, the app just starts in Simulation Mode — useful for
+  checking the UI works before you're next to the actual stage.
+  - **Lockin backend**: `flex` (the Levylab FLEX framework, internal).
+  - **nidaqstudio backend**: the `nidaqstudio` Python package (internal).
+    Its own GUI or headless server (`python -m nidaqstudio`) runs
+    separately — often on a different machine than this app — and this
+    package just needs its client library importable to talk to that
+    server over the network.
+  - **NI-DAQmx backend**: `pip install nidaqmx` plus NI's own NI-DAQmx
+    driver. Only works on the PC the PXI chassis is plugged into — this is
+    the fastest option, see below.
 
 ## Installing
 
@@ -76,9 +80,10 @@ at `%LOCALAPPDATA%\Levylab\PiezoScanner\config.yaml`, created with defaults
 on first run. Edit it by hand or use **Settings → Configure Hardware…** in
 the app — same thing. It holds:
 
-- which backend to use: `lockin` or `nidaqstudio` (and, for nidaqstudio,
-  the host/port it's listening on, plus the sample rate used to play each
-  line's table — see below)
+- which backend to use: `lockin`, `nidaqstudio` or `nidaqmx` (and, for
+  nidaqstudio, the host/port it's listening on plus a sample rate; for
+  nidaqmx, which cards to use, the sample rate, and voltage ranges — see
+  below)
 - which output channel drives X, Y, and Z (set a channel to 0 to disable
   that axis — Z is off by default, and 3D mode / Find Surface only appear
   once you give Z a channel)
@@ -126,6 +131,42 @@ wherever you normally run it, and only `pip install`/`uv pip install`
 `nidaqstudio` into *this* app's environment for the client library. If you
 do need to launch it from a shared environment for some reason,
 `--api-only` sidesteps the problem — it never imports the GUI at all.
+
+**NI-DAQmx (direct)** drives the cards itself through NI's driver, with no
+nidaqstudio process in between. It has to run on the chassis PC, and
+that's the whole point: no network, no request/reply per line, no software
+streaming — the card plays the entire scan from a buffer that's written
+before it starts (the way an Asylum-style controller works). In the config
+dialog:
+
+1. Switch the backend dropdown to NI-DAQmx (direct).
+2. Enter the DAQmx device names of the cards *this app* may use, as NI MAX
+   shows them (e.g. `PXI1Slot2, PXI1Slot3`), in the order you want their
+   channels numbered. **Detect Devices** lists everything the driver can
+   see. Cards you don't list are never touched, so the rest of the chassis
+   stays free for other software.
+3. **Test** opens the devices and reports the resulting channel map, the
+   coerced sample rate, and the sync report — read it once, especially on a
+   multi-card setup.
+
+Channel numbers are 1-indexed sequentially across the listed devices, in
+order: with two 4461s (2 AO + 2 AI each), outputs 1–2 are the first card's
+`ao0`/`ao1` and 3–4 the second card's, inputs likewise; 0 still means
+disabled. So X on `PXI1Slot2/ao0`, Y on `PXI1Slot2/ao1`, Z on
+`PXI1Slot3/ao0` is `devices: [PXI1Slot2, PXI1Slot3]`, X=1, Y=2, Z=3.
+
+Two hardware facts worth knowing for this backend:
+
+- DSA cards like the 4461 are hardware-timed only, so "hold X at 3 V"
+  (centering, jogging, stepping Z) is done by playing a short finite burst
+  of that value and letting the DAC hold its last sample afterwards. The
+  app asks the card to maintain its last value when idle where the driver
+  exposes that choice. If you ever see an output drop to 0 V between
+  operations on some card, that card doesn't hold — tell me which one.
+- The delta-sigma converters have a fixed group delay in each direction
+  (on the 4461s, roughly 370 µs AI + 290 µs AO). The app reads both from
+  the driver and shifts the data by exactly that, so the **Lag** setting
+  is only for the piezo's own mechanical lag, not the electronics.
 
 ### Making scans faster
 
@@ -198,6 +239,22 @@ gradually and watch nidaqstudio's own underflow counter while running real
 scans — that's the actual floor on your specific hardware, and it isn't
 something derivable from a spec sheet.
 
+**NI-DAQmx (direct)** has none of the above. The whole raster — every
+line's settle + ramp on X, the Y staircase, Z and anything else held
+constant — is built as one array per output, committed to a finite
+hardware-timed AO task *before* it starts, and played by the card on its
+own sample clock. AI is a finite task slaved to the same clock and start
+trigger, so line *k* is just samples `[k·n, (k+1)·n)` of the acquisition,
+read back in chunks as they arrive so the image still fills in live.
+Nothing is refilled or patched while the scan runs, so there is no
+software timing margin to protect: Settle is purely what the stage
+physically needs (0 is allowed), and the only remaining limits are the
+card's sample rate, the piezo/amplifier bandwidth, and detector noise vs.
+dwell time. One thing to be aware of: since the card is committed to the
+whole scan, **Pause only pauses the display** — the stage keeps moving and
+the lines just queue up until you resume. Abort really does stop the
+hardware, and parks X at its start.
+
 Under the hood, this app holds X/Y/Z continuously at their last commanded
 voltage between sweeps (so the stage doesn't drift back to 0 V), and folds
 every currently-held channel into whatever's running (an isolated sweep,
@@ -230,10 +287,11 @@ before a scan.
   - `scanner.py` — the scan pattern (raster generation, line-by-line
     scanning, single-axis sweeps, image reconstruction). Talks to hardware
     only through a `backend`, never directly.
-  - `backends/` — the two backend implementations behind that interface:
-    `lockin_backend.py` (Lockin/simulated DAQ) and `nidaq_backend.py`
-    (nidaqstudio, over its ZMQ client). Swapping backends only ever
-    touches this folder plus `simulated_daq.py`.
+  - `backends/` — the backend implementations behind that interface:
+    `lockin_backend.py` (Lockin/simulated DAQ), `nidaq_backend.py`
+    (nidaqstudio, over its ZMQ client) and `nidaqmx_backend.py` (NI cards
+    directly through NI-DAQmx). Swapping backends only ever touches this
+    folder plus `simulated_daq.py`.
   - `simulated_daq.py` — stands in for the real lock-in when there's no
     hardware, so the rest of the app doesn't need to know the difference.
 - `src/piezoscanner/gui/` — the PyQt6 interface (control panel, plots,

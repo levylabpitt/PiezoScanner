@@ -22,7 +22,7 @@ from PyQt6.QtWidgets import (
     QStatusBar,
 )
 
-from ..core.backends import LockinBackend, NidaqBackend, ScannerBackend
+from ..core.backends import LockinBackend, NidaqBackend, NidaqmxBackend, ScannerBackend
 from ..core.config import AppConfig, load_config
 from ..core.profiles import ScannerProfile
 from ..core.scanner import PiezoScanner, ScanLineResult
@@ -59,6 +59,22 @@ def _connect_backend(app_config: AppConfig) -> tuple[ScannerBackend, bool, str]:
         except Exception as exc:
             print(f"nidaqstudio connection failed: {exc}. Running in Simulation Mode.")
             return LockinBackend(SimulatedDaq()), False, "nidaqstudio (unreachable)"
+
+    if app_config.backend == "nidaqmx":
+        try:
+            backend = NidaqmxBackend(
+                app_config.nidaqmx.devices,
+                sample_rate=app_config.nidaqmx.sample_rate,
+                ao_range=app_config.nidaqmx.ao_range,
+                ai_range=app_config.nidaqmx.ai_range,
+                sync=app_config.nidaqmx.sync,
+            )
+            for line in backend.sync_report:
+                print(f"NI-DAQmx: {line}")
+            return backend, True, "NI-DAQmx"
+        except Exception as exc:
+            print(f"NI-DAQmx initialization failed: {exc}. Running in Simulation Mode.")
+            return LockinBackend(SimulatedDaq()), False, "NI-DAQmx (unreachable)"
 
     try:
         from flex.inst.levylab.Lockin import Lockin
@@ -695,7 +711,7 @@ class MainWindow(QMainWindow):
             self, "About FLEX PiezoScanner",
             "FLEX PiezoScanner\n\n"
             "Piezo raster-scan controller with a switchable hardware backend "
-            "(Multichannel Lockin or nidaqstudio).\n\n"
+            "(Multichannel Lockin, nidaqstudio, or NI-DAQmx direct).\n\n"
             f"Backend: {self._backend_label} "
             f"({'connected' if self.hardware_connected else 'simulated'})",
         )

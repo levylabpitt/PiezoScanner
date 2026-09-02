@@ -1,3 +1,4 @@
-"""FLEX PiezoScanner: piezo raster-scanner controller built on a Levylab FLEX Lockin."""
+"""FLEX PiezoScanner: piezo raster-scanner controller with a switchable
+hardware backend (Multichannel Lockin, nidaqstudio, or NI-DAQmx direct)."""
 
-__version__ = "1.4.0"
+__version__ = "1.5.0"

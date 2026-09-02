@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "piezoscanner"
-version = "1.4.0"
-description = "FLEX PiezoScanner: PyQt6 controller and live raster-scan viewer for piezo scan stages, with a switchable Multichannel Lockin / nidaqstudio backend."
+version = "1.5.0"
+description = "FLEX PiezoScanner: PyQt6 controller and live raster-scan viewer for piezo scan stages, with a switchable Multichannel Lockin / nidaqstudio / NI-DAQmx backend."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Proprietary" }
@@ -24,6 +24,8 @@ dependencies = [
 #   - "nidaqstudio" backend: nidaqstudio (talks to it over ZMQ -- the
 #      nidaqstudio *server* process, GUI or --api-only, runs separately
 #      and doesn't need to be on this machine or in this environment)
+#   - "nidaqmx" backend:     nidaqmx (pip install nidaqmx) plus NI's own
+#      NI-DAQmx driver -- only works on the PC the PXI chassis is in
 
 [project.scripts]
 piezoscanner = "piezoscanner.__main__:main"
