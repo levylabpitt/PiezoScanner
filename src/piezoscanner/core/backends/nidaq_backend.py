@@ -40,17 +40,16 @@ from .base import ScannerBackend
 
 DEFAULT_SAMPLE_RATE = 13_000.0
 
-# run_scan_lines' continuous mode needs the queued output buffer (at least
-# _MIN_CHUNK_SAMPLES * _MIN_BUFFER_CHUNKS samples, nidaqstudio's own hard
-# floors) to drain well within one line's Settle window, or a live per-line
-# Y update can't reliably land before the line it's meant for even starts.
-# Below that, fall back to the base class's safe isolated-sweep-per-line
-# default instead of risking misaligned data -- raise the configured sample
-# rate (cheap here, unlike the isolated-sweep path: the continuous path
-# never re-sends a per-sample table) or Settle time if you want continuous
-# mode on very short/fast lines.
-_MIN_CHUNK_SAMPLES = 64
-_MIN_BUFFER_CHUNKS = 3
+# run_scan_lines' continuous mode needs the queued output buffer (whatever
+# chunk_samples * buffer_chunks is already configured -- deliberately not
+# shrunk towards nidaqstudio's minimum, see the safety check in
+# run_scan_lines for why) to drain well within one line's Settle window, or
+# a live per-line Y update can't reliably land before the line it's meant
+# for even starts. Below that, fall back to the base class's safe
+# isolated-sweep-per-line default instead of risking misaligned data --
+# raise Settle, or lower chunk_samples/buffer_chunks in nidaqstudio's own
+# config if your hardware tolerates it, if you want continuous mode on
+# very short/fast lines.
 
 
 class _DataSubscriber:
@@ -316,16 +315,30 @@ class NidaqBackend(ScannerBackend):
         wait_frac = initial_wait / (line_time + initial_wait) if initial_wait > 0 else 0.0
         wait_n = int(round(wait_frac * n))
 
+        original_config = self.rig.config()
+        chunk_samples = int(original_config["timing"].get("chunk_samples", 2048))
+        buffer_chunks = int(original_config["timing"].get("buffer_chunks", 4))
+
         # Y's live update for line k+1 is only safe to land within line k+1's
         # own settle window (wait_n samples = initial_wait seconds): any
         # earlier and it can still corrupt the tail of line k's ramp, any
         # later and it corrupts the start of line k+1's ramp. If the queued
-        # output buffer alone (chunk_samples * buffer_chunks, at the hard
-        # floors nidaqstudio enforces) takes longer than that to drain, an
-        # update can't reliably land in time -- fall back to the safe
-        # isolated-sweep-per-line default rather than risk misaligned pixels.
-        # (Settle = 0 has no landing window at all, so it always falls back.)
-        predicted_output_latency = (_MIN_CHUNK_SAMPLES * _MIN_BUFFER_CHUNKS) / self.sample_rate
+        # output buffer alone (chunk_samples * buffer_chunks) takes longer
+        # than that to drain, an update can't reliably land in time -- fall
+        # back to the safe isolated-sweep-per-line default rather than risk
+        # misaligned pixels. (Settle = 0 has no landing window at all, so it
+        # always falls back.)
+        #
+        # This deliberately uses whatever chunk_samples/buffer_chunks are
+        # already configured rather than shrinking them towards
+        # nidaqstudio's absolute minimum (64 / 3) to buy more timing margin:
+        # a thinner buffer has less headroom against real OS/driver
+        # scheduling jitter refilling it in time, and underflowing it stops
+        # the acquisition outright -- something the simulator, with no real
+        # hardware timing pressure, won't ever show you. If Settle needs to
+        # be longer to accommodate your hardware's actual buffer depth,
+        # that's the safer trade to make.
+        predicted_output_latency = (chunk_samples * buffer_chunks) / self.sample_rate
         if initial_wait <= 0.0 or predicted_output_latency > initial_wait * 0.5:
             yield from super().run_scan_lines(
                 x_min=x_min, x_max=x_max, x_points=x_points, y_values=y_values,
@@ -339,7 +352,6 @@ class NidaqBackend(ScannerBackend):
         y_name = self._ao_name(slow_axis_channel)
         ai_names = [self._ai_name(ch) for ch in detector_channels]
 
-        original_config = self.rig.config()
         config = copy.deepcopy(original_config)
 
         amplitude = abs(x_max - x_min) / 2.0
@@ -380,14 +392,11 @@ class NidaqBackend(ScannerBackend):
         for ch in config["ai_channels"]:
             ch["enabled"] = ch["physical_channel"] in ai_names
 
-        # Pinned to exactly the floors the safety check above validated
-        # against -- anything larger would widen the queued buffer past
-        # what was just confirmed fits inside a Settle window.
+        # chunk_samples/buffer_chunks are intentionally left as already
+        # configured -- see the safety check above for why.
         timing = config["timing"]
         timing["mode"] = "continuous"
         timing["sample_rate"] = self.sample_rate
-        timing["chunk_samples"] = _MIN_CHUNK_SAMPLES
-        timing["buffer_chunks"] = _MIN_BUFFER_CHUNKS
         timing["history_seconds"] = max(timing.get("history_seconds", 10.0), 4 * n / self.sample_rate)
 
         subscriber = _DataSubscriber(self.rig.pub_endpoint, timeout_s=max(line_time * 20.0, 10.0))
@@ -409,7 +418,28 @@ class NidaqBackend(ScannerBackend):
 
                 target = (line_idx + 1) * n
                 while received < target:
-                    msg = subscriber.recv()
+                    try:
+                        msg = subscriber.recv()
+                    except TimeoutError:
+                        # Enrich with what nidaqstudio itself last reported --
+                        # in particular underflows/overruns/last_error, so a
+                        # real-hardware stall (the output task couldn't be
+                        # refilled in time and gave up) is distinguishable
+                        # from, say, the server having simply gone away.
+                        try:
+                            status = self.rig.status()
+                            detail = (
+                                f"engine state={status.get('state')}, "
+                                f"underflows={status.get('underflows')}, "
+                                f"overruns={status.get('overruns')}, "
+                                f"last_error={status.get('last_error')!r}"
+                            )
+                        except Exception as status_exc:
+                            detail = f"(could not fetch engine status: {status_exc})"
+                        raise TimeoutError(
+                            f"No data received from nidaqstudio's PUB stream in time "
+                            f"while waiting for line {line_idx + 1}/{y_points}. {detail}"
+                        ) from None
                     start_sample = int(msg["start_sample"])
                     if start_sample != received:
                         raise RuntimeError(

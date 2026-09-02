@@ -159,17 +159,28 @@ isn't sharing zero-latency loopback with this app (a separate rack PC, or
 any real network hop): in a simulated-latency test at 20 ms/call, a
 15-line scan went from 2.6× the ideal time down to 1.1× it.
 
-This needs Settle to be long enough for a live Y update to land reliably
-inside it (roughly `Settle ≳ 2 × 192 / sample_rate` seconds, using
-nidaqstudio's own minimum buffering — a couple ms at the default 13000
-Sa/s, taking longer only at unusually low sample rates). If Settle is too
-short for that, the app automatically falls back to the same one-sweep-
-per-line approach Lockin uses, correct either way — it just won't be as
-fast. Practically: **raise the nidaqstudio sample rate rather than lower
-it** if you want continuous mode on very short/fast lines — unlike the old
-per-line approach, the continuous path never re-sends a per-sample table,
-so a higher rate no longer costs more network payload, and it directly
-widens how short a Settle time can safely go.
+This needs Settle to be long enough for a live Y update to land reliably:
+roughly `Settle ≳ 2 × chunk_samples × buffer_chunks / sample_rate` seconds,
+using **whatever nidaqstudio's own output buffer is currently configured
+to** (not shrunk by this app — a thin buffer gives more timing margin, but
+real hardware needs real margin against normal OS/driver scheduling
+jitter, or the output task can underflow and the acquisition stalls; the
+simulator has no such pressure, so this only bites on real hardware). At
+nidaqstudio's stock defaults (`chunk_samples=2048`, `buffer_chunks=4`) that
+works out to roughly 1.3 s at 13000 Sa/s — so continuous mode won't
+actually engage until Settle clears that, and the app falls back to the
+same one-sweep-per-line approach Lockin uses below it. Falling back is
+always correct, just not as fast.
+
+To get continuous mode at a *shorter* Settle, lower `chunk_samples`/
+`buffer_chunks` in nidaqstudio itself (its own GUI, or
+`rig.set_timing(chunk_samples=..., buffer_chunks=...)`) rather than
+lowering Settle — and do it gradually, watching nidaqstudio's own
+underflow counter while running real scans, since that's the actual limit
+on how far it can go on your specific hardware. Raising the sample rate
+also helps, and is otherwise cheap here: unlike the old per-line approach,
+the continuous path never re-sends a per-sample table, so a higher rate
+doesn't cost more network payload.
 
 Under the hood, this app holds X/Y/Z continuously at their last commanded
 voltage between sweeps (so the stage doesn't drift back to 0 V), and folds
