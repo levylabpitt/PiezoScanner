@@ -1,23 +1,25 @@
 """Backend driving NI PXIe cards through a running ``nidaqstudio`` process
 (GUI or ``--api-only``) over its ZMQ API.
 
-Two distinct modes share one connection:
+Three distinct modes share one connection:
 
 - :meth:`set_dc` holds an AO channel at a fixed DC voltage *continuously* —
   the way this app expects an output to behave between sweeps (center
-  stage, jog, line flyback, Z step). This is done with the raw
-  ``nidaqstudio.client`` API: patch the channel to ``shape="dc"`` at the
-  target offset, make sure the engine is running continuously.
+  stage, jog, Z step). This is done with the raw ``nidaqstudio.client``
+  API: patch the channel to ``shape="dc"`` at the target offset, make sure
+  the engine is running continuously.
 - :meth:`run_sweep` plays an exact per-sample table on one or more AO
   channels while recording AI channels, as one isolated finite run
-  (``nidaqstudio.scanner.Scanner.table``). A scan like this explicitly
-  disables every channel not part of it and restores the engine's prior
-  configuration (unstarted) when it finishes — so every channel currently
-  held by :meth:`set_dc` is folded into the sweep as a flat (constant)
-  table alongside whichever channels are actually being swept, so nothing
-  glitches or drops during the run. The next :meth:`set_dc` call (this
-  app's scan loop always flies the fast axis back right after a sweep)
-  naturally resumes the continuous hold afterward.
+  (``nidaqstudio.scanner.Scanner.table``). Used for the Find Surface axis
+  sweep. A scan like this explicitly disables every channel not part of
+  it and restores the engine's prior configuration (unstarted) when it
+  finishes — so every channel currently held by :meth:`set_dc` is folded
+  into the sweep as a flat (constant) table, so nothing glitches or drops
+  during the run.
+- :meth:`run_scan_lines` overrides the base class's one-sweep-per-line
+  default with one *continuous* acquisition for the whole scan. See its
+  docstring for why and how — this is where the real speed difference
+  between backends lives.
 
 Channel numbers here are **1-indexed**, matching the "0 = disabled"
 convention used everywhere else in this app's configuration: app channel 1
@@ -27,13 +29,65 @@ the same sequential numbering nidaqstudio's own GUI shows.
 
 from __future__ import annotations
 
-from typing import Sequence
+import copy
+import json
+import time
+from typing import Callable, Iterator, Sequence
 
 import numpy as np
 
 from .base import ScannerBackend
 
 DEFAULT_SAMPLE_RATE = 13_000.0
+
+# run_scan_lines' continuous mode needs the queued output buffer (at least
+# _MIN_CHUNK_SAMPLES * _MIN_BUFFER_CHUNKS samples, nidaqstudio's own hard
+# floors) to drain well within one line's Settle window, or a live per-line
+# Y update can't reliably land before the line it's meant for even starts.
+# Below that, fall back to the base class's safe isolated-sweep-per-line
+# default instead of risking misaligned data -- raise the configured sample
+# rate (cheap here, unlike the isolated-sweep path: the continuous path
+# never re-sends a per-sample table) or Settle time if you want continuous
+# mode on very short/fast lines.
+_MIN_CHUNK_SAMPLES = 64
+_MIN_BUFFER_CHUNKS = 3
+
+
+class _DataSubscriber:
+    """Minimal PUB/SUB subscriber for nidaqstudio's ``data`` topic.
+
+    The high-level ``NidaqStudio.stream()`` helper discards ``start_sample``;
+    this keeps it, because that's what lets :meth:`NidaqBackend.run_scan_lines`
+    detect a block nidaqstudio dropped (a slow subscriber "just drops
+    messages rather than holding up acquisition", per nidaqstudio's own
+    README) instead of silently concatenating non-contiguous data.
+    """
+
+    def __init__(self, pub_endpoint: str, timeout_s: float):
+        import zmq  # optional dependency (comes with nidaqstudio); lazy on purpose
+
+        self._zmq = zmq
+        self._ctx = zmq.Context.instance()
+        self._sock = self._ctx.socket(zmq.SUB)
+        self._sock.setsockopt(zmq.SUBSCRIBE, b"data")
+        self._sock.setsockopt(zmq.RCVTIMEO, int(timeout_s * 1000))
+        self._sock.connect(pub_endpoint)
+        # ZMQ's PUB/SUB "slow joiner" problem: a subscriber can miss the
+        # first messages published just after it connects, since PUB does
+        # not queue for subscribers that haven't finished subscribing yet.
+        # A short grace period before the caller starts the acquisition
+        # avoids racing this.
+        time.sleep(0.2)
+
+    def recv(self) -> dict:
+        try:
+            _topic, payload = self._sock.recv_multipart()
+        except self._zmq.Again as exc:
+            raise TimeoutError("No data received from nidaqstudio's PUB stream in time.") from exc
+        return json.loads(payload)
+
+    def close(self) -> None:
+        self._sock.close(0)
 
 
 class NidaqBackend(ScannerBackend):
@@ -92,6 +146,16 @@ class NidaqBackend(ScannerBackend):
             raise ValueError(
                 f"No AO channel {channel} -- nidaqstudio reports {len(names)} "
                 f"AO channel(s) (1..{len(names)})."
+            )
+        return names[idx]
+
+    def _ai_name(self, channel: int) -> str:
+        names = self._channel_names()["ai"]
+        idx = channel - 1
+        if not (0 <= idx < len(names)):
+            raise ValueError(
+                f"No AI channel {channel} -- nidaqstudio reports {len(names)} "
+                f"AI channel(s) (1..{len(names)})."
             )
         return names[idx]
 
@@ -183,6 +247,228 @@ class NidaqBackend(ScannerBackend):
             t_source = np.linspace(0, duration, trimmed.size)
             out[channel] = np.interp(t_target, t_source, trimmed)
         return out
+
+    # ------------------------------------------------------------------
+    # Continuous multi-line scan
+    # ------------------------------------------------------------------
+    def run_scan_lines(
+        self,
+        *,
+        x_min: float,
+        x_max: float,
+        x_points: int,
+        y_values: Sequence[float],
+        fast_axis_channel: int,
+        slow_axis_channel: int,
+        detector_channels: Sequence[int],
+        line_time: float,
+        initial_wait: float,
+        should_abort: Callable[[], bool] | None = None,
+    ) -> Iterator[dict[int, np.ndarray]]:
+        """Acquire the whole scan as *one* continuous run instead of an
+        isolated finite sweep per line.
+
+        Every line's fast-axis (X) trajectory is identical, so X is set up
+        **once**, as a native periodic waveform, and never touched again for
+        the rest of the scan:
+
+        - X plays an ``expression`` shape that holds flat at x_min for the
+          settle fraction of each cycle, then ramps linearly to x_max —
+          exactly the wait-then-ramp-then-snap-back pattern the isolated
+          per-line sweep builds fresh each time, just expressed once as a
+          repeating cycle instead of replayed as a table every line. This
+          deliberately avoids ``shape="arbitrary"``: nidaqstudio's live
+          config patches preserve the phase accumulator across a change (by
+          design, so tweaking a running sine's frequency doesn't glitch),
+          which means swapping an *arbitrary table's content* mid-cycle
+          would start reading the new table from the old table's phase
+          position, not from its own sample 0 -- silently misaligning
+          pixels. A fixed periodic expression sidesteps that: it's only
+          ever set up once, before the acquisition starts.
+        - Y is ``shape="dc"``, whose value has no phase/cycle dependency at
+          all, so live-patching its offset between lines is genuinely
+          glitch-free. Line k+1's Y update is pushed the instant line k's
+          samples have all been received — the earliest moment it's safe,
+          since line k's ramp needs Y[k] stable right up to its last sample —
+          giving the update all of line k+1's own Settle window to land
+          before that line's ramp begins.
+
+        Line boundaries in the data are pure arithmetic, not detection: since
+        X's frequency and this call's own sample_rate never change once the
+        acquisition starts, line *k* is deterministically samples
+        ``[k*n, (k+1)*n)`` counting from when the task started. Data itself
+        is consumed from the ``PUB`` stream rather than polled, since that
+        was most of the round trips the isolated-sweep path spent per line.
+
+        Falls back to the base class's isolated-sweep-per-line default when
+        Settle (``initial_wait``) is too short relative to the queued output
+        buffer's drain time for a live Y update to reliably land inside it.
+        """
+        y_values = list(y_values)
+        y_points = len(y_values)
+        if y_points == 0:
+            return
+        if not detector_channels:
+            raise ValueError("run_scan_lines requires at least one detector channel")
+
+        initial_wait = max(initial_wait, 0.0)
+        n = max(int(round((line_time + initial_wait) * self.sample_rate)), 2)
+        wait_frac = initial_wait / (line_time + initial_wait) if initial_wait > 0 else 0.0
+        wait_n = int(round(wait_frac * n))
+
+        # Y's live update for line k+1 is only safe to land within line k+1's
+        # own settle window (wait_n samples = initial_wait seconds): any
+        # earlier and it can still corrupt the tail of line k's ramp, any
+        # later and it corrupts the start of line k+1's ramp. If the queued
+        # output buffer alone (chunk_samples * buffer_chunks, at the hard
+        # floors nidaqstudio enforces) takes longer than that to drain, an
+        # update can't reliably land in time -- fall back to the safe
+        # isolated-sweep-per-line default rather than risk misaligned pixels.
+        # (Settle = 0 has no landing window at all, so it always falls back.)
+        predicted_output_latency = (_MIN_CHUNK_SAMPLES * _MIN_BUFFER_CHUNKS) / self.sample_rate
+        if initial_wait <= 0.0 or predicted_output_latency > initial_wait * 0.5:
+            yield from super().run_scan_lines(
+                x_min=x_min, x_max=x_max, x_points=x_points, y_values=y_values,
+                fast_axis_channel=fast_axis_channel, slow_axis_channel=slow_axis_channel,
+                detector_channels=detector_channels, line_time=line_time,
+                initial_wait=initial_wait, should_abort=should_abort,
+            )
+            return
+
+        x_name = self._ao_name(fast_axis_channel)
+        y_name = self._ao_name(slow_axis_channel)
+        ai_names = [self._ai_name(ch) for ch in detector_channels]
+
+        original_config = self.rig.config()
+        config = copy.deepcopy(original_config)
+
+        amplitude = abs(x_max - x_min) / 2.0
+        offset = (x_max + x_min) / 2.0
+        frequency = self.sample_rate / n
+        if wait_frac > 0:
+            expression = (
+                f"where(p < {wait_frac!r}, -1.0, "
+                f"-1.0 + 2.0*(p - {wait_frac!r}) / {1.0 - wait_frac!r})"
+            )
+        else:
+            expression = "2.0*p - 1.0"
+
+        # Every other channel this backend is currently holding (e.g. Z
+        # during a 3D scan) rides along as its own flat DC channel, exactly
+        # like run_sweep folds held channels into an isolated sweep.
+        other_held = {
+            self._ao_name(ch): value
+            for ch, value in self._held.items()
+            if ch not in (fast_axis_channel, slow_axis_channel)
+        }
+
+        for ch in config["ao_channels"]:
+            phys = ch["physical_channel"]
+            if phys == x_name:
+                ch.update(
+                    enabled=True, shape="expression", expression=expression,
+                    amplitude=amplitude, amplitude_unit="Vpk", offset=offset,
+                    frequency=frequency, phase_deg=0.0,
+                )
+            elif phys == y_name:
+                ch.update(enabled=True, shape="dc", offset=float(y_values[0]), amplitude=0.0)
+            elif phys in other_held:
+                ch.update(enabled=True, shape="dc", offset=other_held[phys], amplitude=0.0)
+            else:
+                ch["enabled"] = False
+
+        for ch in config["ai_channels"]:
+            ch["enabled"] = ch["physical_channel"] in ai_names
+
+        # Pinned to exactly the floors the safety check above validated
+        # against -- anything larger would widen the queued buffer past
+        # what was just confirmed fits inside a Settle window.
+        timing = config["timing"]
+        timing["mode"] = "continuous"
+        timing["sample_rate"] = self.sample_rate
+        timing["chunk_samples"] = _MIN_CHUNK_SAMPLES
+        timing["buffer_chunks"] = _MIN_BUFFER_CHUNKS
+        timing["history_seconds"] = max(timing.get("history_seconds", 10.0), 4 * n / self.sample_rate)
+
+        subscriber = _DataSubscriber(self.rig.pub_endpoint, timeout_s=max(line_time * 20.0, 10.0))
+        last_completed_line = -1
+        try:
+            self.rig.set_config(config)
+            self.rig.start()
+            if not self.rig.wait_until_running(timeout=10.0):
+                raise TimeoutError("nidaqstudio did not start the continuous scan acquisition in time.")
+
+            buffer_offset = 0  # global sample index that buffers[...][0] corresponds to
+            buffers: dict[str, np.ndarray] = {phys: np.empty(0, dtype=np.float64) for phys in ai_names}
+            received = 0
+            next_prefetch = 1
+
+            for line_idx in range(y_points):
+                if should_abort is not None and should_abort():
+                    break
+
+                target = (line_idx + 1) * n
+                while received < target:
+                    msg = subscriber.recv()
+                    start_sample = int(msg["start_sample"])
+                    if start_sample != received:
+                        raise RuntimeError(
+                            f"nidaqstudio data stream gap detected (expected sample "
+                            f"{received}, got {start_sample}) -- the subscriber fell "
+                            f"behind and nidaqstudio dropped a block. Try a lower "
+                            f"sample rate or a larger buffer."
+                        )
+                    data = msg["data"]
+                    block_len = len(data[0]) if data else 0
+                    for i, phys in enumerate(msg["channels"]):
+                        if phys in buffers:
+                            buffers[phys] = np.concatenate(
+                                [buffers[phys], np.asarray(data[i], dtype=np.float64)]
+                            )
+                    received += block_len
+
+                # Only now is it safe to move Y on to the next line: we've
+                # just finished needing this line's Y value to stay stable.
+                # This gives the update the entirety of the next line's own
+                # Settle window to land before that line's ramp begins.
+                if next_prefetch < y_points and next_prefetch == line_idx + 1:
+                    self.rig.set_ao(y_name, offset=float(y_values[next_prefetch]))
+                    next_prefetch += 1
+
+                start_local = line_idx * n - buffer_offset
+                end_local = start_local + n
+                pixels: dict[int, np.ndarray] = {}
+                for channel, phys in zip(detector_channels, ai_names):
+                    segment = buffers[phys][start_local:end_local][wait_n:]
+                    if segment.size >= 2:
+                        pixels[channel] = np.interp(
+                            np.linspace(0, 1, x_points), np.linspace(0, 1, segment.size), segment,
+                        )
+                    else:
+                        pixels[channel] = np.full(x_points, np.nan)
+                yield pixels
+                last_completed_line = line_idx
+
+                new_offset = (line_idx + 1) * n
+                drop_local = new_offset - buffer_offset
+                for phys in ai_names:
+                    buffers[phys] = buffers[phys][drop_local:]
+                buffer_offset = new_offset
+        finally:
+            subscriber.close()
+            try:
+                self.rig.stop()
+            finally:
+                self.rig.set_config(original_config)
+                # Always leave the stage actively, continuously held
+                # somewhere real afterward -- matches the guarantee the
+                # per-line default gives via its flyback -- rather than
+                # leaving the engine configured-but-idle.
+                resting_line = max(last_completed_line, 0)
+                self._held[fast_axis_channel] = x_min
+                self._held[slow_axis_channel] = float(y_values[resting_line])
+                self._push_hold_config()
+                self.rig.start()
 
     def close(self) -> None:
         try:

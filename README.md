@@ -129,38 +129,54 @@ do need to launch it from a shared environment for some reason,
 
 ### Making scans faster
 
-Total scan time is `y_points × (line_time + Settle)`, roughly, plus small
-per-line backend overhead. In order of how much each one actually saves:
+Total scan time is `y_points × (line_time + Settle)`, roughly, plus backend
+overhead. That overhead looks very different depending on the backend:
+
+**Lockin** does one hardware sweep per line — there's no way around that,
+it's how the instrument works. The only levers are the ones you already
+control directly:
 
 1. **Settle** (Scan Configuration group) — how long each line holds at its
    start before ramping, to let the flyback finish settling. It's charged
    once *per line*, so at the old fixed 1 s default a 50-line scan spent 50
-   extra seconds here alone. It's now a GUI field — lower it until you see
-   a distorted/smeared left edge on your lines, then back off a bit; that's
-   your real floor, and it depends on your stage's mechanical settling
-   time, not the backend.
-2. **nidaqstudio sample rate** (Settings → Configure Hardware, nidaqstudio
-   only) — this sets how many points make up each line's/sweep's played
-   table. Measured on the simulator: dropping it from 13000 to ~1000–2000
-   Sa/s cut per-line backend overhead from ~190 ms to ~50 ms, with no loss
-   of resolution in the saved image (that's set by Pixels X×Y, not this).
-   Push it low; there's rarely a reason for it to exceed a few kSa/s for a
-   spatial ramp.
-3. **Line time** itself — the direct lever, with the direct tradeoff: less
+   extra seconds here alone. Lower it until you see a distorted/smeared
+   left edge on your lines, then back off a bit — that's your real floor,
+   and it depends on your stage's mechanical settling time, not the
+   software.
+2. **Line time** — the direct lever, with the direct tradeoff: less
    integration time per pixel means more noise. How far you can push it
-   depends on your signal, not the software.
+   depends on your signal.
 
-The backend's own overhead beyond that (config round trips, starting the
-acquisition, reading it back) is small on a local connection — tens to
-low-hundreds of milliseconds per line — so it's rarely the dominant cost
-next to Settle and Line time.
+**nidaqstudio** doesn't have to sweep line-by-line at all: the whole scan
+runs as *one* continuous acquisition. X plays a fixed waveform set up once
+at the start (it never changes between lines, since every line's ramp is
+identical), Y's value live-updates between lines with no task restart, and
+data comes back over nidaqstudio's push-based data stream instead of being
+polled for. Concretely, this replaced roughly 20 request/reply round trips
+per line with about 1 — on the same local connection that's already a
+measurable win, and it gets much larger the moment the nidaqstudio server
+isn't sharing zero-latency loopback with this app (a separate rack PC, or
+any real network hop): in a simulated-latency test at 20 ms/call, a
+15-line scan went from 2.6× the ideal time down to 1.1× it.
+
+This needs Settle to be long enough for a live Y update to land reliably
+inside it (roughly `Settle ≳ 2 × 192 / sample_rate` seconds, using
+nidaqstudio's own minimum buffering — a couple ms at the default 13000
+Sa/s, taking longer only at unusually low sample rates). If Settle is too
+short for that, the app automatically falls back to the same one-sweep-
+per-line approach Lockin uses, correct either way — it just won't be as
+fast. Practically: **raise the nidaqstudio sample rate rather than lower
+it** if you want continuous mode on very short/fast lines — unlike the old
+per-line approach, the continuous path never re-sends a per-sample table,
+so a higher rate no longer costs more network payload, and it directly
+widens how short a Settle time can safely go.
 
 Under the hood, this app holds X/Y/Z continuously at their last commanded
 voltage between sweeps (so the stage doesn't drift back to 0 V), and folds
-every currently-held channel into each line/sweep's synchronized table so
-nothing glitches mid-scan — you don't need to think about any of this, it's
-just what makes "Center Stage" and a running scan cooperate correctly on a
-backend built around isolated finite acquisitions.
+every currently-held channel into whatever's running (an isolated sweep,
+or the continuous scan acquisition) so nothing glitches mid-scan — you
+don't need to think about any of this, it's just what makes "Center Stage"
+and a running scan cooperate correctly.
 
 ## 3D scans
 

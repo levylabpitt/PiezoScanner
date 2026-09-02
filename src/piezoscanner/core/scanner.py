@@ -187,30 +187,27 @@ class PiezoScanner:
         if slow_axis_down:
             y_levels = y_levels[::-1]
 
-        for line_idx, y_val in enumerate(y_levels):
-            if should_abort is not None and should_abort():
-                return
+        lines = self.backend.run_scan_lines(
+            x_min=x_min,
+            x_max=x_max,
+            x_points=x_points,
+            y_values=y_levels,
+            fast_axis_channel=self.fast_axis_channel,
+            slow_axis_channel=self.slow_axis_channel,
+            detector_channels=detector_channels,
+            line_time=line_time,
+            initial_wait=self.initial_wait,
+            should_abort=should_abort,
+        )
 
-            raw = self.backend.run_sweep(
-                ao_tables={
-                    self.fast_axis_channel: np.linspace(x_min, x_max, x_points),
-                    self.slow_axis_channel: np.full(x_points, y_val),
-                },
-                ai_channels=detector_channels,
-                duration=line_time,
-                initial_wait=self.initial_wait,
-            )
-
-            # Fly back to the line start immediately; see the settle note
-            # above for why this doesn't wait on its own.
-            self.backend.set_dc(self.fast_axis_channel, x_min, settle=False)
-
+        for line_idx, raw in enumerate(lines):
             pixels: dict[int, np.ndarray] = {}
             for channel, line_pixels in raw.items():
                 if delay_samples:
                     line_pixels = np.roll(line_pixels, -delay_samples)
                 pixels[channel] = line_pixels
 
+            y_val = y_levels[line_idx]
             row_index = (y_points - 1 - line_idx) if slow_axis_down else line_idx
             yield ScanLineResult(line_index=line_idx, row_index=row_index, y_value=y_val, pixels=pixels)
 
