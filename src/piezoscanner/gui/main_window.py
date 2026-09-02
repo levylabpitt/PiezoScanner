@@ -22,6 +22,7 @@ from PyQt6.QtWidgets import (
     QStatusBar,
 )
 
+from ..core.backends import LockinBackend, NidaqBackend, ScannerBackend
 from ..core.config import AppConfig, load_config
 from ..core.profiles import ScannerProfile
 from ..core.scanner import PiezoScanner, ScanLineResult
@@ -37,17 +38,35 @@ ORG_NAME = "LevyLab"
 APP_NAME = "PiezoScanner"
 
 
-def _connect_hardware():
-    """Try the real Levylab FLEX lock-in; fall back to a simulated DAQ that
-    implements the same surface so the rest of the app never has to know
-    the difference."""
+def _connect_backend(app_config: AppConfig) -> tuple[ScannerBackend, bool, str]:
+    """Connect to whichever backend the config selects.
+
+    Returns ``(backend, connected, label)``. If the selected backend can't
+    be reached, falls back to a simulated DAQ (shared by both backend
+    kinds, wrapped in a LockinBackend since that's the interface it
+    implements) so the app stays fully usable either way — ``connected``
+    and ``label`` tell the caller what was actually requested and whether
+    it's real or simulated.
+    """
+    if app_config.backend == "nidaqstudio":
+        try:
+            backend = NidaqBackend(
+                host=app_config.nidaq.host,
+                port=app_config.nidaq.port,
+                sample_rate=app_config.nidaq.sample_rate,
+            )
+            return backend, True, "nidaqstudio"
+        except Exception as exc:
+            print(f"nidaqstudio connection failed: {exc}. Running in Simulation Mode.")
+            return LockinBackend(SimulatedDaq()), False, "nidaqstudio (unreachable)"
+
     try:
         from flex.inst.levylab.Lockin import Lockin
 
-        return Lockin(), True
+        return LockinBackend(Lockin()), True, "Multichannel Lockin"
     except Exception as exc:
         print(f"Hardware initialization failed: {exc}. Running in Simulation Mode.")
-        return SimulatedDaq(), False
+        return LockinBackend(SimulatedDaq()), False, "Multichannel Lockin (unreachable)"
 
 
 class MainWindow(QMainWindow):
@@ -57,9 +76,8 @@ class MainWindow(QMainWindow):
         self.resize(1500, 900)
 
         self.settings = QSettings(ORG_NAME, APP_NAME)
-        self.daq, self.hardware_connected = _connect_hardware()
-
         self.app_config, config_error = load_config()
+        self.backend, self.hardware_connected, self._backend_label = _connect_backend(self.app_config)
 
         self.worker: ScanWorker | None = None
         self._active_config: dict | None = None
@@ -183,10 +201,10 @@ class MainWindow(QMainWindow):
 
     def _update_hardware_status_label(self):
         if self.hardware_connected:
-            self.lbl_hw_status.setText("● Hardware Connected")
+            self.lbl_hw_status.setText(f"● {self._backend_label} Connected")
             self.lbl_hw_status.setStyleSheet("color: #3fb950; font-weight: 600;")
         else:
-            self.lbl_hw_status.setText("● Simulation Mode")
+            self.lbl_hw_status.setText(f"● Simulation Mode ({self._backend_label})")
             self.lbl_hw_status.setStyleSheet("color: #d9a441; font-weight: 600;")
 
     # ------------------------------------------------------------------
@@ -226,6 +244,13 @@ class MainWindow(QMainWindow):
     def _apply_config(self):
         self.control_panel.set_profiles(self.app_config.profiles)
         self.control_panel.set_z_available(self.app_config.outputs.z_enabled)
+        self._reconnect_backend()
+
+    def _reconnect_backend(self):
+        old_backend = self.backend
+        self.backend, self.hardware_connected, self._backend_label = _connect_backend(self.app_config)
+        self._update_hardware_status_label()
+        old_backend.close()
 
     def _profile_for(self, name: str) -> ScannerProfile:
         profile = self.app_config.profiles.get(name)
@@ -239,12 +264,11 @@ class MainWindow(QMainWindow):
         # without mutating the shared config.
         profile = dc_replace(profile, calibration_um_per_v=cfg["calibration_um_per_v"])
         return PiezoScanner(
-            daq=self.daq,
+            backend=self.backend,
             profile=profile,
             fast_axis_channel=self.app_config.outputs.x_channel,
             slow_axis_channel=self.app_config.outputs.y_channel,
-            daq_fs=13000,
-            daq_num_samples=1000,
+            initial_wait=cfg.get("initial_wait", 1.0),
         )
 
     # ------------------------------------------------------------------
@@ -478,6 +502,7 @@ class MainWindow(QMainWindow):
             f"points: {cfg['x_points']} x {cfg['y_points']}",
             f"slow_axis_direction: {'down (y_max -> y_min)' if cfg.get('slow_axis_down') else 'up (y_min -> y_max)'}",
             f"line_time_s: {cfg['line_time']}",
+            f"initial_wait_s: {cfg.get('initial_wait', 1.0)}",
             f"lag_delay_samples: {cfg['delay_samples']}",
             f"x_output_channel: {outputs.x_channel}",
             f"y_output_channel: {outputs.y_channel}",
@@ -572,8 +597,8 @@ class MainWindow(QMainWindow):
         self.control_panel.set_status(f"Moving to X={x_v:.3f} V, Y={y_v:.3f} V...")
 
         def _do_move():
-            self.daq.setAO_DC(outputs.x_channel, x_v)
-            self.daq.setAO_DC(outputs.y_channel, y_v)
+            self.backend.set_dc(outputs.x_channel, x_v)
+            self.backend.set_dc(outputs.y_channel, y_v)
             return x_v, y_v
 
         command = QuickCommand(_do_move)
@@ -669,8 +694,10 @@ class MainWindow(QMainWindow):
         QMessageBox.about(
             self, "About FLEX PiezoScanner",
             "FLEX PiezoScanner\n\n"
-            "Piezo raster-scan controller for a Levylab FLEX Lockin.\n\n"
-            f"Hardware: {'Connected' if self.hardware_connected else 'Simulation Mode'}",
+            "Piezo raster-scan controller with a switchable hardware backend "
+            "(Multichannel Lockin or nidaqstudio).\n\n"
+            f"Backend: {self._backend_label} "
+            f"({'connected' if self.hardware_connected else 'simulated'})",
         )
 
     # ------------------------------------------------------------------
@@ -725,4 +752,5 @@ class MainWindow(QMainWindow):
             self.worker.wait(5000)
 
         self._save_settings()
+        self.backend.close()
         event.accept()

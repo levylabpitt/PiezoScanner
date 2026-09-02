@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "piezoscanner"
-version = "1.2.0"
-description = "FLEX PiezoScanner: PyQt6 controller and live raster-scan viewer for piezo scan stages driven through a Levylab FLEX Lockin."
+version = "1.3.1"
+description = "FLEX PiezoScanner: PyQt6 controller and live raster-scan viewer for piezo scan stages, with a switchable Multichannel Lockin / nidaqstudio backend."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Proprietary" }
@@ -17,10 +17,13 @@ dependencies = [
     "PyYAML>=6.0",
 ]
 
-# `flex` (the Levylab FLEX instrument framework that provides
-# flex.inst.levylab.Lockin.Lockin) is an internal lab package distributed
-# outside PyPI. Install it separately in the same environment before running
-# this tool. Without it, the application still launches in Simulation Mode.
+# Both hardware backends are internal packages distributed outside PyPI --
+# install whichever one(s) you need separately in the same environment.
+# Without either, the application still launches in Simulation Mode.
+#   - "lockin" backend:     flex (flex.inst.levylab.Lockin.Lockin)
+#   - "nidaqstudio" backend: nidaqstudio (talks to it over ZMQ -- the
+#      nidaqstudio *server* process, GUI or --api-only, runs separately
+#      and doesn't need to be on this machine or in this environment)
 
 [project.scripts]
 piezoscanner = "piezoscanner.__main__:main"

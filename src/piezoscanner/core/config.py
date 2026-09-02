@@ -1,7 +1,8 @@
 """Hardware configuration stored as a user-editable YAML file.
 
-Holds the AO channel assignments for the X/Y/Z outputs (0 = disabled) and
-the set of available stage profiles. Lives at
+Holds which backend drives the scanner (Multichannel Lockin or
+nidaqstudio), the AO channel assignments for the X/Y/Z outputs (0 =
+disabled), and the set of available stage profiles. Lives at
 ``%LOCALAPPDATA%/Levylab/PiezoScanner/config.yaml`` and is seeded with
 sensible defaults on first run, so users can either edit it by hand or go
 through the in-app configuration dialog.
@@ -11,15 +12,25 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from typing import Literal
 
 import yaml
 
+from .backends.nidaq_backend import DEFAULT_SAMPLE_RATE as NIDAQ_DEFAULT_SAMPLE_RATE
 from .profiles import DEFAULT_PROFILES, ScannerProfile
+
+BackendName = Literal["lockin", "nidaqstudio"]
 
 
 @dataclass
 class OutputConfig:
-    """AO channel driving each axis. 0 means the axis is disabled."""
+    """Output channel driving each axis. 0 means the axis is disabled.
+
+    Channel numbers are interpreted by whichever backend is active: for
+    Multichannel Lockin they're the instrument's own AO numbers; for
+    nidaqstudio they're 1-indexed into its AO0/AO1/... sequence (channel 1
+    = AO0, channel 2 = AO1, ...).
+    """
 
     x_channel: int = 11
     y_channel: int = 12
@@ -31,8 +42,20 @@ class OutputConfig:
 
 
 @dataclass
+class NidaqConfig:
+    """Connection settings for the nidaqstudio backend. Only used when
+    ``AppConfig.backend == "nidaqstudio"``."""
+
+    host: str = "127.0.0.1"
+    port: int = 8765
+    sample_rate: float = NIDAQ_DEFAULT_SAMPLE_RATE
+
+
+@dataclass
 class AppConfig:
+    backend: BackendName = "lockin"
     outputs: OutputConfig = field(default_factory=OutputConfig)
+    nidaq: NidaqConfig = field(default_factory=NidaqConfig)
     profiles: dict[str, ScannerProfile] = field(default_factory=lambda: dict(DEFAULT_PROFILES))
 
 
@@ -44,8 +67,12 @@ def config_path() -> str:
 _HEADER = """\
 # FLEX PiezoScanner hardware configuration.
 #
-# outputs: which lock-in AO channel drives each axis. 0 = disabled.
-#          A non-zero z_channel is required for 3D scans and Find Surface.
+# backend: "lockin" (Levylab FLEX Multichannel Lockin) or "nidaqstudio".
+# outputs: which AO channel drives each axis. 0 = disabled. A non-zero
+#          z_channel is required for 3D scans and Find Surface. For the
+#          nidaqstudio backend, channels are 1-indexed into its AO0/AO1/...
+#          and AI0/AI1/... sequence (channel 1 = AO0/AI0, 2 = AO1/AI1, ...).
+# nidaq: connection settings, only used when backend is "nidaqstudio".
 # profiles: safe voltage range and um/V calibration per stage.
 #           calibrated: false shows a warning in the app until you've
 #           measured and entered a real calibration value.
@@ -94,11 +121,22 @@ def load_config(path: str | None = None) -> tuple[AppConfig, str | None]:
         with open(path, encoding="utf-8") as fh:
             raw = yaml.safe_load(fh) or {}
 
+        backend = raw.get("backend", "lockin")
+        if backend not in ("lockin", "nidaqstudio"):
+            backend = "lockin"
+
         outputs_raw = raw.get("outputs") or {}
         outputs = OutputConfig(
             x_channel=int(outputs_raw.get("x_channel", 11)),
             y_channel=int(outputs_raw.get("y_channel", 12)),
             z_channel=int(outputs_raw.get("z_channel", 0)),
+        )
+
+        nidaq_raw = raw.get("nidaq") or {}
+        nidaq = NidaqConfig(
+            host=str(nidaq_raw.get("host", "127.0.0.1")),
+            port=int(nidaq_raw.get("port", 8765)),
+            sample_rate=float(nidaq_raw.get("sample_rate", NIDAQ_DEFAULT_SAMPLE_RATE)),
         )
 
         profiles_raw = raw.get("profiles") or {}
@@ -109,7 +147,7 @@ def load_config(path: str | None = None) -> tuple[AppConfig, str | None]:
         if not profiles:
             profiles = dict(DEFAULT_PROFILES)
 
-        return AppConfig(outputs=outputs, profiles=profiles), None
+        return AppConfig(backend=backend, outputs=outputs, nidaq=nidaq, profiles=profiles), None
     except Exception as exc:
         return AppConfig(), f"Could not read {path} ({exc}). Using default configuration."
 
@@ -119,10 +157,16 @@ def save_config(config: AppConfig, path: str | None = None) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
 
     doc = {
+        "backend": config.backend,
         "outputs": {
             "x_channel": config.outputs.x_channel,
             "y_channel": config.outputs.y_channel,
             "z_channel": config.outputs.z_channel,
+        },
+        "nidaq": {
+            "host": config.nidaq.host,
+            "port": config.nidaq.port,
+            "sample_rate": config.nidaq.sample_rate,
         },
         "profiles": {name: _profile_to_dict(p) for name, p in config.profiles.items()},
     }

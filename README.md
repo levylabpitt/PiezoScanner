@@ -1,9 +1,10 @@
 # FLEX PiezoScanner
 
-PyQt6 app for driving a piezo scan stage through the Levylab FLEX Lockin and
-grabbing raster-scan images off up to 3 detector channels. Supports plain 2D
-scans and 3D stacks (a 2D scan at each Z level), plus a find-surface tool
-for locating the sample along Z.
+PyQt6 app for driving a piezo scan stage and grabbing raster-scan images
+off up to 3 detector channels. Supports plain 2D scans and 3D stacks (a 2D
+scan at each Z level), plus a find-surface tool for locating the sample
+along Z. The hardware backend is switchable — either the Levylab FLEX
+Multichannel Lockin, or an NI PXIe rig driven through `nidaqstudio`.
 
 This replaces the old `app.py` / `piezoscanner.py` scripts. Same basic idea,
 but rewritten as a proper installable package: scanning runs on its own
@@ -16,10 +17,16 @@ matter what profile/range you had set).
 
 - Python 3.10+
 - PyQt6, numpy, matplotlib, PyYAML — these get installed automatically
-- `flex` (the Levylab FLEX framework), if you want to talk to real hardware.
-  It's an internal package, not on PyPI, so you install it separately into
-  the same environment. Without it the app just starts in Simulation Mode —
-  useful for checking the UI works before you're next to the actual stage.
+- One of the two hardware backends, if you want to talk to real hardware.
+  Both are internal packages, not on PyPI, so you install whichever one you
+  need separately into the same environment. Without either, the app just
+  starts in Simulation Mode — useful for checking the UI works before
+  you're next to the actual stage.
+  - **Lockin backend**: `flex` (the Levylab FLEX framework).
+  - **nidaqstudio backend**: the `nidaqstudio` Python package. Its own GUI
+    or headless server (`python -m nidaqstudio`) runs separately — often on
+    a different machine than this app — and this package just needs its
+    client library importable to talk to that server over the network.
 
 ## Installing
 
@@ -64,18 +71,96 @@ piezoscanner
 
 ## Hardware configuration
 
-Output wiring and stage profiles live in a YAML file at
-`%LOCALAPPDATA%\Levylab\PiezoScanner\config.yaml`, created with defaults on
-first run. Edit it by hand or use **Settings → Configure Hardware…** in the
-app — same thing. It holds:
+Backend choice, output wiring, and stage profiles all live in a YAML file
+at `%LOCALAPPDATA%\Levylab\PiezoScanner\config.yaml`, created with defaults
+on first run. Edit it by hand or use **Settings → Configure Hardware…** in
+the app — same thing. It holds:
 
-- which AO channel drives X, Y, and Z (set a channel to 0 to disable that
-  axis — Z is off by default, and 3D mode / Find Surface only appear once
-  you give Z a channel)
+- which backend to use: `lockin` or `nidaqstudio` (and, for nidaqstudio,
+  the host/port it's listening on, plus the sample rate used to play each
+  line's table — see below)
+- which output channel drives X, Y, and Z (set a channel to 0 to disable
+  that axis — Z is off by default, and 3D mode / Find Surface only appear
+  once you give Z a channel)
 - the list of stage profiles: safe voltage range, um/V calibration, and a
   calibrated yes/no flag (uncalibrated profiles show a warning in the app)
 
 Adding a new stage is just adding a few lines to that file.
+
+Switching backend or its connection settings takes effect as soon as you
+hit Save in the dialog — no restart needed (it can't be changed mid-scan
+though; finish or abort first).
+
+### Choosing a backend
+
+**Lockin** talks to the Levylab FLEX Multichannel Lockin the way this app
+always has. Output/input channel numbers are the Lockin's own AO/AI
+numbers (11, 12, 8, 9, ... — whatever your instrument uses).
+
+**nidaqstudio** talks to NI PXIe cards through a separately-running
+`nidaqstudio` process (its own GUI, or `python -m nidaqstudio --api-only`
+for a headless rack PC) over ZMQ — this app never touches the DAQmx driver
+directly. Start that process first, then in the config dialog:
+
+1. Switch the backend dropdown to nidaqstudio.
+2. Set Host/Port (defaults to `127.0.0.1:8765`, nidaqstudio's default).
+3. Hit **Test Connection** to confirm it's reachable before saving.
+
+Channel numbers for this backend are **1-indexed into nidaqstudio's own
+AO0/AO1/... and AI0/AI1/... sequence** (the same numbering its GUI shows,
+sequential across every card): channel 1 = AO0/AI0, channel 2 = AO1/AI1,
+and so on — 0 still means disabled. Since nidaqstudio auto-detects hardware,
+the channel count depends on whatever cards are actually in the chassis.
+
+**Run the nidaqstudio server from its own environment, not this app's.**
+This app only needs `nidaqstudio`'s client (`nidaqstudio.client` /
+`nidaqstudio.scanner`), which is Qt-free — but `nidaqstudio`'s own package
+declares PySide6 + pyqtgraph as hard dependencies for its GUI, and *this*
+app depends on PyQt6. If both end up installed in the same environment and
+you then launch `nidaqstudio`'s own GUI (plain `nidaqstudio --simulate`,
+no `--api-only`) from that environment, pyqtgraph's Qt-binding
+autodetection can pick the wrong one and it'll crash on startup with a
+`TypeError` from `addWidget` — that's `nidaqstudio`'s GUI failing, not
+this app. Keep them apart: run `nidaqstudio` (GUI or `--api-only`) from
+wherever you normally run it, and only `pip install`/`uv pip install`
+`nidaqstudio` into *this* app's environment for the client library. If you
+do need to launch it from a shared environment for some reason,
+`--api-only` sidesteps the problem — it never imports the GUI at all.
+
+### Making scans faster
+
+Total scan time is `y_points × (line_time + Settle)`, roughly, plus small
+per-line backend overhead. In order of how much each one actually saves:
+
+1. **Settle** (Scan Configuration group) — how long each line holds at its
+   start before ramping, to let the flyback finish settling. It's charged
+   once *per line*, so at the old fixed 1 s default a 50-line scan spent 50
+   extra seconds here alone. It's now a GUI field — lower it until you see
+   a distorted/smeared left edge on your lines, then back off a bit; that's
+   your real floor, and it depends on your stage's mechanical settling
+   time, not the backend.
+2. **nidaqstudio sample rate** (Settings → Configure Hardware, nidaqstudio
+   only) — this sets how many points make up each line's/sweep's played
+   table. Measured on the simulator: dropping it from 13000 to ~1000–2000
+   Sa/s cut per-line backend overhead from ~190 ms to ~50 ms, with no loss
+   of resolution in the saved image (that's set by Pixels X×Y, not this).
+   Push it low; there's rarely a reason for it to exceed a few kSa/s for a
+   spatial ramp.
+3. **Line time** itself — the direct lever, with the direct tradeoff: less
+   integration time per pixel means more noise. How far you can push it
+   depends on your signal, not the software.
+
+The backend's own overhead beyond that (config round trips, starting the
+acquisition, reading it back) is small on a local connection — tens to
+low-hundreds of milliseconds per line — so it's rarely the dominant cost
+next to Settle and Line time.
+
+Under the hood, this app holds X/Y/Z continuously at their last commanded
+voltage between sweeps (so the stage doesn't drift back to 0 V), and folds
+every currently-held channel into each line/sweep's synchronized table so
+nothing glitches mid-scan — you don't need to think about any of this, it's
+just what makes "Center Stage" and a running scan cooperate correctly on a
+backend built around isolated finite acquisitions.
 
 ## 3D scans
 
@@ -99,8 +184,13 @@ before a scan.
   - `profiles.py` — the default stage profiles (PSJ, PI) used to seed the
     config file.
   - `config.py` — reads/writes the YAML hardware config.
-  - `scanner.py` — talks to the DAQ: raster generation, line-by-line
-    scanning, single-axis sweeps, image reconstruction.
+  - `scanner.py` — the scan pattern (raster generation, line-by-line
+    scanning, single-axis sweeps, image reconstruction). Talks to hardware
+    only through a `backend`, never directly.
+  - `backends/` — the two backend implementations behind that interface:
+    `lockin_backend.py` (Lockin/simulated DAQ) and `nidaq_backend.py`
+    (nidaqstudio, over its ZMQ client). Swapping backends only ever
+    touches this folder plus `simulated_daq.py`.
   - `simulated_daq.py` — stands in for the real lock-in when there's no
     hardware, so the rest of the app doesn't need to know the difference.
 - `src/piezoscanner/gui/` — the PyQt6 interface (control panel, plots,
@@ -127,3 +217,8 @@ before a scan.
   or fix it permanently in the config file / config dialog once measured.
 - Window size, last-used scan settings, save folder, channel setup, and
   theme all get remembered between runs.
+- If the configured backend can't be reached at startup (Lockin not
+  running, or nidaqstudio unreachable at its configured host/port), the
+  app falls back to Simulation Mode rather than failing to launch — the
+  status bar says which backend was actually requested vs. that it's
+  simulated, so it's obvious when you're not talking to real hardware.

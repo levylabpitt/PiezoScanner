@@ -1,3 +1,3 @@
 """FLEX PiezoScanner: piezo raster-scanner controller built on a Levylab FLEX Lockin."""
 
-__version__ = "1.2.0"
+__version__ = "1.3.1"

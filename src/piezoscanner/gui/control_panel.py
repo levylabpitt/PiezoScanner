@@ -197,7 +197,21 @@ class ControlPanel(QWidget):
         self.spin_delay.setToolTip("Samples to shift every line by, to correct constant acquisition lag (usually 0)")
         grid.addWidget(self.spin_delay, 1, 4)
 
-        # Rows 2-4: axis ranges, one row each
+        # Row 2: settle time
+        grid.addWidget(QLabel("Settle"), 2, 0)
+        self.spin_initial_wait = QDoubleSpinBox()
+        self.spin_initial_wait.setRange(0.0, 60.0)
+        self.spin_initial_wait.setDecimals(2)
+        self.spin_initial_wait.setSuffix(" s")
+        self.spin_initial_wait.setValue(1.0)
+        self.spin_initial_wait.setToolTip(
+            "Time to hold at each line's start (x_min) before the ramp begins, letting the "
+            "flyback settle. This runs once per line, so it's a direct multiplier on total scan "
+            "time — lower it for speed, but too low risks a distorted left edge on each line."
+        )
+        grid.addWidget(self.spin_initial_wait, 2, 1)
+
+        # Rows 3-5: axis ranges, one row each
         def _v_spin(default: float) -> QDoubleSpinBox:
             spin = QDoubleSpinBox()
             spin.setRange(-100.0, 100.0)
@@ -207,40 +221,40 @@ class ControlPanel(QWidget):
             spin.valueChanged.connect(self._update_scan_size_readout)
             return spin
 
-        grid.addWidget(QLabel("X range"), 2, 0)
+        grid.addWidget(QLabel("X range"), 3, 0)
         self.spin_x_min = _v_spin(0.0)
         self.spin_x_max = _v_spin(10.0)
-        grid.addWidget(self.spin_x_min, 2, 1)
-        grid.addWidget(self.spin_x_max, 2, 2)
+        grid.addWidget(self.spin_x_min, 3, 1)
+        grid.addWidget(self.spin_x_max, 3, 2)
 
-        grid.addWidget(QLabel("Y range"), 3, 0)
+        grid.addWidget(QLabel("Y range"), 4, 0)
         self.spin_y_min = _v_spin(0.0)
         self.spin_y_max = _v_spin(10.0)
-        grid.addWidget(self.spin_y_min, 3, 1)
-        grid.addWidget(self.spin_y_max, 3, 2)
+        grid.addWidget(self.spin_y_min, 4, 1)
+        grid.addWidget(self.spin_y_max, 4, 2)
 
         self._lbl_z_range = QLabel("Z range")
-        grid.addWidget(self._lbl_z_range, 4, 0)
+        grid.addWidget(self._lbl_z_range, 5, 0)
         self.spin_z_min = _v_spin(0.0)
         self.spin_z_max = _v_spin(10.0)
-        grid.addWidget(self.spin_z_min, 4, 1)
-        grid.addWidget(self.spin_z_max, 4, 2)
+        grid.addWidget(self.spin_z_min, 5, 1)
+        grid.addWidget(self.spin_z_max, 5, 2)
         self._lbl_z_steps = QLabel("Steps")
-        grid.addWidget(self._lbl_z_steps, 4, 3)
+        grid.addWidget(self._lbl_z_steps, 5, 3)
         self.spin_z_steps = QSpinBox()
         self.spin_z_steps.setRange(2, 500)
         self.spin_z_steps.setValue(10)
         self.spin_z_steps.setToolTip("Number of Z levels (one 2D scan per level)")
-        grid.addWidget(self.spin_z_steps, 4, 4)
+        grid.addWidget(self.spin_z_steps, 5, 4)
         self._z_widgets = (
             self._lbl_z_range, self.spin_z_min, self.spin_z_max,
             self._lbl_z_steps, self.spin_z_steps,
         )
 
-        # Row 5: physical size readout
+        # Row 6: physical size readout
         self.lbl_scan_size = QLabel("")
         self.lbl_scan_size.setProperty("muted", True)
-        grid.addWidget(self.lbl_scan_size, 5, 0, 1, 5)
+        grid.addWidget(self.lbl_scan_size, 6, 0, 1, 5)
 
         grid.setColumnStretch(1, 1)
         grid.setColumnStretch(2, 1)
@@ -577,7 +591,7 @@ class ControlPanel(QWidget):
         # too: repositioning the stage mid-sweep would corrupt the running scan.
         for widget in (
             self.combo_mode,
-            self.spin_x_points, self.spin_y_points, self.spin_line_time,
+            self.spin_x_points, self.spin_y_points, self.spin_line_time, self.spin_initial_wait,
             self.spin_x_min, self.spin_x_max, self.spin_y_min, self.spin_y_max,
             self.spin_delay, self.combo_profile, self.spin_calibration,
             self.btn_add_channel,
@@ -612,6 +626,7 @@ class ControlPanel(QWidget):
             x_points=self.spin_x_points.value(),
             y_points=self.spin_y_points.value(),
             line_time=self.spin_line_time.value(),
+            initial_wait=self.spin_initial_wait.value(),
             x_min=self.spin_x_min.value(),
             x_max=self.spin_x_max.value(),
             y_min=self.spin_y_min.value(),
@@ -631,6 +646,7 @@ class ControlPanel(QWidget):
             "x_points": self.spin_x_points,
             "y_points": self.spin_y_points,
             "line_time": self.spin_line_time,
+            "initial_wait": self.spin_initial_wait,
             "x_min": self.spin_x_min,
             "x_max": self.spin_x_max,
             "y_min": self.spin_y_min,

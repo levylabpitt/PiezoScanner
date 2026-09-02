@@ -88,7 +88,9 @@ class ScanWorker(QThread):
                     break
 
                 if is_3d:
-                    self.scanner.daq.setAO_DC(self.z_channel, z_value)
+                    # settle=False: the fixed Z_SETTLE_MS sleep right after is
+                    # this app's own settle time, independent of backend.
+                    self.scanner.set_dc(self.z_channel, z_value, settle=False)
                     self.msleep(Z_SETTLE_MS)
                     self.slice_started.emit(slice_idx, z_value)
 

@@ -175,7 +175,7 @@ class FindSurfaceDialog(QDialog):
         self.btn_goto.setEnabled(False)
         self.lbl_result.setText(f"Moving Z to {z_target:.3f} V…")
 
-        command = QuickCommand(self.scanner.daq.setAO_DC, self.z_channel, z_target)
+        command = QuickCommand(self.scanner.set_dc, self.z_channel, z_target)
         command.signals.result.connect(lambda _: self._on_moved(z_target))
         command.signals.error.connect(self._on_move_error)
         QThreadPool.globalInstance().start(command)
